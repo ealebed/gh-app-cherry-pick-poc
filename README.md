@@ -303,3 +303,4 @@ http(s)://<external-address>/webhook
 
 ## TODO:
 - Test coverage report/badge
+- Expose `/metrics` with counters for events processed, PRs opened, conflicts, no-ops
