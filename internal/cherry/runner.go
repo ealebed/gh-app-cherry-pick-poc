@@ -15,11 +15,38 @@ type GitActor struct {
 	Email string
 }
 
-// ErrNoopCherryPick means the cherry-pick produced no net changes on the target
-// branch (commit already present or merge resolved to empty diff).
-var ErrNoopCherryPick = errors.New("cherry-pick produced no changes")
+// --- test seam: minimal interface our code needs ---
+type gitRunner interface {
+	Clean() // NOTE: no error return to match gitexec.Runner
+	CloneWithToken(ctx context.Context, owner, repo, token string) error
+	ConfigUser(ctx context.Context, name, email string) error
+	Fetch(ctx context.Context, refs ...string) error
+	CheckoutBranchFrom(ctx context.Context, newBranch, fromRef string) error
+	CherryPick(ctx context.Context, sha string) error
+	CherryPickWithMainline(ctx context.Context, mainline int, sha string) error
+	Push(ctx context.Context, branch string) error
+}
 
-// DoCherryPick cherry-picks a single commit SHA onto target branch and pushes a new work branch.
+// injectable constructor (overridden in tests)
+var newGitRunner = func(cwd string, env ...string) (gitRunner, error) {
+	return gitexec.NewRunner(cwd, env...)
+}
+
+// ErrNoopCherryPick signals the commit is already present / empty diff
+var ErrNoopCherryPick = errors.New("noop cherry-pick")
+
+// isNoopCherryPickErr detects “empty” cherry-pick scenarios from git output.
+func isNoopCherryPickErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "previous cherry-pick is now empty") ||
+		strings.Contains(s, "nothing to commit") ||
+		strings.Contains(s, "working tree clean")
+}
+
+// DoCherryPick cherry-picks a single non-merge commit onto target branch and pushes a new work branch.
 func DoCherryPick(ctx context.Context, owner, repo, token, targetBranch, sha string, actor GitActor) (string, error) {
 	return doCherryPick(ctx, owner, repo, token, targetBranch, sha, actor, 0)
 }
@@ -30,7 +57,7 @@ func DoCherryPickWithMainline(ctx context.Context, owner, repo, token, targetBra
 }
 
 func doCherryPick(ctx context.Context, owner, repo, token, targetBranch, sha string, actor GitActor, mainline int) (string, error) {
-	r, err := gitexec.NewRunner("", "GIT_ASKPASS=true")
+	r, err := newGitRunner("", "GIT_ASKPASS=true")
 	if err != nil {
 		return "", err
 	}
@@ -43,11 +70,11 @@ func doCherryPick(ctx context.Context, owner, repo, token, targetBranch, sha str
 		return "", err
 	}
 
-	// Fetch target branch tip and ensure the commit object exists locally.
+	// Fetch target branch and the specific commit (and also master as a common case)
 	if err := r.Fetch(ctx,
 		"master:refs/remotes/origin/master",
 		fmt.Sprintf("refs/heads/%s:refs/remotes/origin/%s", targetBranch, targetBranch),
-		sha,
+		sha, // ensure the object exists locally
 	); err != nil {
 		return "", err
 	}
@@ -59,44 +86,34 @@ func doCherryPick(ctx context.Context, owner, repo, token, targetBranch, sha str
 	safeTarget := strings.ReplaceAll(targetBranch, "/", "-")
 	workBranch := fmt.Sprintf("autocherry/%s/%s", safeTarget, short)
 
-	// Base the work branch on the target branch
+	// Base new branch on the target branch
 	if err := r.CheckoutBranchFrom(ctx, workBranch, "origin/"+targetBranch); err != nil {
 		return "", err
 	}
 
-	// Cherry-pick (handle merge/no-op cases)
-	var cpErr error
+	// Cherry-pick
 	if mainline > 0 {
 		slog.Debug("git.cherry_pick_mainline", "sha", sha, "mainline", mainline)
-		cpErr = r.CherryPickWithMainline(ctx, mainline, sha)
+		if err := r.CherryPickWithMainline(ctx, mainline, sha); err != nil {
+			if isNoopCherryPickErr(err) {
+				slog.Info("cherry.noop", "target", targetBranch, "sha", sha)
+				return "", ErrNoopCherryPick
+			}
+			return "", fmt.Errorf("conflict cherry-picking %s to %s (mainline %d): %w", sha, targetBranch, mainline, err)
+		}
 	} else {
-		cpErr = r.CherryPick(ctx, sha)
+		if err := r.CherryPick(ctx, sha); err != nil {
+			if isNoopCherryPickErr(err) {
+				slog.Info("cherry.noop", "target", targetBranch, "sha", sha)
+				return "", ErrNoopCherryPick
+			}
+			return "", fmt.Errorf("conflict cherry-picking %s to %s: %w", sha, targetBranch, err)
+		}
 	}
 
-	if cpErr != nil {
-		// Git reports no-op cherry-picks as an "error" — detect and treat as no-op.
-		if isNoopCherryPickErr(cpErr) {
-			_ = r.CherryPickSkip(ctx) // clean state
-			slog.Info("git.noop_cherry_pick", "sha", sha, "target", targetBranch)
-			return "", ErrNoopCherryPick
-		}
-		// Real conflict/error
-		if mainline > 0 {
-			return "", fmt.Errorf("conflict cherry-picking %s to %s (mainline %d): %w", sha, targetBranch, mainline, cpErr)
-		}
-		return "", fmt.Errorf("conflict cherry-picking %s to %s: %w", sha, targetBranch, cpErr)
-	}
-
-	// Push the work branch so we can open a PR
+	// Push work branch
 	if err := r.Push(ctx, workBranch); err != nil {
 		return "", err
 	}
 	return workBranch, nil
-}
-
-func isNoopCherryPickErr(err error) bool {
-	s := err.Error()
-	return strings.Contains(s, "previous cherry-pick is now empty") ||
-		strings.Contains(s, "The previous cherry-pick is now empty") ||
-		strings.Contains(s, "nothing to commit, working tree clean")
 }
