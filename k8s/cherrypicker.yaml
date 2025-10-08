@@ -1,0 +1,93 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cherrypicker
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cherrypicker
+  namespace: cherrypicker
+  labels:
+    app: cherrypicker
+spec:
+  type: LoadBalancer
+  selector:
+    app: cherrypicker
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cherrypicker
+  namespace: cherrypicker
+  labels:
+    app: cherrypicker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cherrypicker
+  template:
+    metadata:
+      labels:
+        app: cherrypicker
+    spec:
+      containers:
+        - name: cherrypicker
+          image: docker.io/ealebed/cherrypicker:latest   # <- replace with a timestamped tag from CI for immutability
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LISTEN_PORT
+              value: ":8080"
+            - name: GITHUB_APP_ID
+              value: "123456"  # <- set your real App ID
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: gh-webhook-secret         # created via kubectl
+                  key: value
+            - name: GITHUB_APP_PRIVATE_KEY_PEM_BASE64
+              valueFrom:
+                secretKeyRef:
+                  name: gh-app-private-key-b64    # created via kubectl
+                  key: value
+            - name: GIT_USER_NAME
+              value: "cherry-pick-bot"
+            - name: GIT_USER_EMAIL
+              value: "cherry-pick-bot@users.noreply.github.com"
+            - name: LOG_LEVEL
+              value: "info"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
