@@ -124,32 +124,32 @@ This repo uses a templated CI:
 
 This service receives GitHub webhooks, verifies the HMAC signature, and then calls the GitHub API. On Cloud Run we’ll:
 
-* deploy the container,
-* wire up secrets via **Secret Manager** (webhook secret + app private key PEM **in base64**),
-* expose the service publicly so GitHub can reach it,
-* set a small min instance to avoid cold starts on webhooks.
+- deploy the container,
+- wire up secrets via **Secret Manager** (webhook secret + app private key PEM **in base64**),
+- expose the service publicly so GitHub can reach it,
+- set a small min instance to avoid cold starts on webhooks.
 
 ### Prerequisites
 
-* A GCP project with **billing enabled** and the **gcloud** CLI authenticated:
+- A GCP project with **billing enabled** and the **gcloud** CLI authenticated:
 
   ```bash
   gcloud auth login
   gcloud config set project <PROJECT_ID>
   ```
-* Enable required APIs:
+- Enable required APIs:
 
   ```bash
   gcloud services enable run.googleapis.com secretmanager.googleapis.com
   ```
-* Your container image in Docker Hub (public), e.g. `docker.io/ealebed/cherrypicker:latest`.
+- Your container image in Docker Hub (public), e.g. `docker.io/ealebed/cherrypicker:latest`.
 
 ### 1) Create secrets in Secret Manager
 
 **We’ll store:**
 
-* `GITHUB_WEBHOOK_SECRET` as plain text.
-* `GITHUB_APP_PRIVATE_KEY_PEM_BASE64` as the **base64** contents of your GitHub App private key PEM (because the app expects base64).
+- `GITHUB_WEBHOOK_SECRET` as plain text.
+- `GITHUB_APP_PRIVATE_KEY_PEM_BASE64` as the **base64** contents of your GitHub App private key PEM (because the app expects base64).
 
 > Secret Manager commands below create a secret and add version 1 from stdin
 
@@ -170,7 +170,7 @@ echo -n "${WEBHOOK_SECRET}" | gcloud secrets create gh-webhook-secret --data-fil
 gcloud secrets create gh-app-private-key-b64 --data-file=/tmp/appkey.b64
 ```
 
-## 2) (Recommended) Create a dedicated service account
+### 2) (Recommended) Create a dedicated service account
 
 Gives the service least privileges + access to read secrets:
 
@@ -183,7 +183,7 @@ gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
   --role="roles/secretmanager.secretAccessor"
 ```
 
-## 3) Deploy to Cloud Run
+### 3) Deploy to Cloud Run
 
 Choose a region close to you (e.g., `europe-central2`). Set variables:
 
@@ -212,10 +212,10 @@ gcloud run deploy "${SERVICE}" \
 
 **Notes:**
 
-* `--allow-unauthenticated` makes the service publicly callable (signature verification still protects you). If your org policy forbids public services, you’ll need to change that or front with an alternative—but for GitHub webhooks, public access is standard.
-* `--min-instances=1` avoids cold start delays so GitHub doesn’t retry webhooks. Tune `max-instances` to your traffic/budget. 
+- `--allow-unauthenticated` makes the service publicly callable (signature verification still protects you). If your org policy forbids public services, you’ll need to change that or front with an alternative—but for GitHub webhooks, public access is standard.
+- `--min-instances=1` avoids cold start delays so GitHub doesn’t retry webhooks. Tune `max-instances` to your traffic/budget. 
 
-## 4) Set the GitHub App webhook URL
+### 4) Set the GitHub App webhook URL
 
 After deploy, get the URL:
 
@@ -232,9 +232,9 @@ In your GitHub App settings, set the webhook to:
 
 (For example: `https://cherrypicker-abcde-uc.a.run.app/webhook`)
 
-## 5) Test the flow
+### 5) Test the flow
 
-## 6) Updating the service
+### 6) Updating the service
 
 When CI pushes a new image tag:
 
@@ -248,3 +248,58 @@ gcloud run deploy "${SERVICE}" \
 (Env vars and secrets persist across revisions unless you change them.)
 
 ---
+
+## Deploying to Kubernetes
+
+### Prerequisites
+
+- A Kubernetes cluster with an external LoadBalancer (e.g., GKE/EKS/AKS).
+- `kubectl` pointing at your cluster context.
+- Your container image published to Docker Hub, e.g. `docker.io/ealebed/cherrypicker:<tag>`.
+
+### 1) Create namespace
+```bash
+kubectl create namespace cherrypicker
+```
+
+### 2) Create secrets
+The app expects:
+- `GITHUB_WEBHOOK_SECRET` – webhook secret string.
+- `GITHUB_APP_PRIVATE_KEY_PEM_BASE64` – base64 of your GitHub App private key PEM.
+
+Webhook secret:
+```bash
+kubectl -n cherrypicker create secret generic gh-webhook-secret \
+  --from-literal=value='your-super-strong-webhook-secret'
+```
+
+Private key (base64 of PEM):
+```bash
+kubectl -n cherrypicker create secret generic gh-app-private-key-b64 \
+  --from-literal=value="$(cat /tmp/appkey.b64)"
+```
+Tip: The value stored in the secret is the base64 string itself (single line, no trailing newline).
+
+### 3) Apply the manifest
+Edit the YAML to set your real `GITHUB_APP_ID` and preferred image tag, then:
+```bash
+kubectl apply -f k8s/cherrypicker.yaml
+```
+
+### 4) Get the external address
+```bash
+# Watch until an external IP/hostname appears
+kubectl -n cherrypicker get svc cherrypicker --watch
+```
+Copy the external address and configure your GitHub App webhook URL as:
+```bash
+http(s)://<external-address>/webhook
+```
+> **HTTPS recommended:** If your LB doesn’t terminate TLS, add an Ingress (e.g., NGINX + cert-manager) to get an HTTPS hostname and point the webhook there.
+
+### 5) Test the flow
+
+---
+
+## TODO:
+- Test coverage report/badge
