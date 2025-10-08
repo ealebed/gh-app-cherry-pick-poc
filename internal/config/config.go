@@ -11,7 +11,7 @@ type Config struct {
 	AppID         int64
 	WebhookSecret []byte
 	PrivateKeyPEM []byte // decoded PEM
-	ListenAddr    string // ":8080"
+	Port          string // ":8080"
 	// Optional:
 	GitUserName  string // "stabilisation-bot"
 	GitUserEmail string // "stabilisation-bot@users.noreply.github.com"
@@ -21,9 +21,9 @@ func Load() (*Config, error) {
 	appIDStr := os.Getenv("GITHUB_APP_ID")
 	secret := os.Getenv("GITHUB_WEBHOOK_SECRET")
 	pemB64 := os.Getenv("GITHUB_APP_PRIVATE_KEY_PEM_BASE64")
-	listen := os.Getenv("LISTEN_ADDR")
-	if listen == "" {
-		listen = ":8080"
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = ":8080"
 	}
 
 	if appIDStr == "" || secret == "" || pemB64 == "" {
@@ -44,7 +44,7 @@ func Load() (*Config, error) {
 		AppID:         appID,
 		WebhookSecret: []byte(secret),
 		PrivateKeyPEM: pem,
-		ListenAddr:    listen,
+		Port:          port,
 		GitUserName:   envOr("GIT_USER_NAME", "stabilisation-bot"),
 		GitUserEmail:  envOr("GIT_USER_EMAIL", "stabilisation-bot@users.noreply.github.com"),
 	}, nil
