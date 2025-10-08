@@ -47,6 +47,6 @@ func main() {
 	r.Handle("/webhook", srv).Methods("POST")
 	r.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }).Methods("GET")
 
-	slog.Info("server.start", "addr", cfg.ListenAddr)
-	log.Fatal(http.ListenAndServe(cfg.ListenAddr, r))
+	slog.Info("server.start", "addr", cfg.Port)
+	log.Fatal(http.ListenAndServe(cfg.Port, r))
 }
