@@ -1,0 +1,34 @@
+version: "2"
+
+run:
+  timeout: 3m
+  tests: false
+
+linters:
+  # disable everything, then opt-in the few you want
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+  exclusions:
+    # optional: treat "generated" laxly; remove if you don't need it
+    generated: lax
+    paths:
+      - ^vendor/
+      - ^deploy/
+      - ^\.github/
+      - ^build/
+      - ^dist/
+      - ^mocks/
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

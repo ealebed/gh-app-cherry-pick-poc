@@ -28,6 +28,11 @@ type Server struct {
 	WebhookSecret []byte
 	GitUserName   string
 	GitUserEmail  string
+
+	// Optional injections for tests
+	NewClients   func(appID, installationID int64, pem []byte) (*githubapp.Clients, error)
+	GetToken     func(ctx context.Context, appID, installationID int64, pem []byte) (string, error)
+	CherryRunner CherryPickRunner
 }
 
 func (s *Server) verifySig(r *http.Request, body []byte) bool {
@@ -42,7 +47,11 @@ func (s *Server) verifySig(r *http.Request, body []byte) bool {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+	defer func() {
+		if cerr := r.Body.Close(); cerr != nil {
+			slog.Warn("http.body_close_error", "err", cerr)
+		}
+	}()
 
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	event := r.Header.Get("X-GitHub-Event")
@@ -103,8 +112,7 @@ func (s *Server) handlePREvent(ctx context.Context, deliveryID string, e *github
 		"inst", instID,
 	)
 
-	// Compute targetsOverride for "labeled" on an already-merged PR:
-	// process *only the newly added label* to avoid reprocessing previous targets.
+	// If the PR was already merged and a new label was added, only process that one label.
 	var targetsOverride []string
 	if action == "labeled" && merged && e.Label != nil {
 		targetsOverride = cherry.ParseTargetBranches([]*github.Label{e.Label})
@@ -120,124 +128,145 @@ func (s *Server) handlePREvent(ctx context.Context, deliveryID string, e *github
 	}
 }
 
+func (s *Server) cherryRunner() CherryPickRunner {
+	if s.CherryRunner != nil {
+		return s.CherryRunner
+	}
+	return realCherryRunner{actor: cherry.GitActor{
+		Name:  s.GitUserName,
+		Email: s.GitUserEmail,
+	}}
+}
+
+// processMergedPR keeps the production path (creating real clients/token) then
+// delegates to processMergedPRWith which is fully testable via injected fakes.
 func (s *Server) processMergedPR(ctx context.Context, deliveryID string, installationID int64, owner, repo string, prNum int, targetsOverride []string) {
-	cli, err := githubapp.NewClients(s.AppID, installationID, s.PrivateKeyPEM)
+	// Build real clients (or injected)
+	var (
+		clients *githubapp.Clients
+		err     error
+	)
+	if s.NewClients != nil {
+		clients, err = s.NewClients(s.AppID, installationID, s.PrivateKeyPEM)
+	} else {
+		clients, err = githubapp.NewClients(s.AppID, installationID, s.PrivateKeyPEM)
+	}
 	if err != nil {
 		slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
 		return
 	}
 
-	// Load PR details
-	pr, _, err := cli.REST.PullRequests.Get(ctx, owner, repo, prNum)
+	// Get an installation token (or injected)
+	var token string
+	if s.GetToken != nil {
+		token, err = s.GetToken(ctx, s.AppID, installationID, s.PrivateKeyPEM)
+	} else {
+		itr, ierr := ghinstallation.New(http.DefaultTransport, s.AppID, installationID, s.PrivateKeyPEM)
+		if ierr != nil {
+			slog.Error("gh.installation_transport_error", "delivery", deliveryID, "err", ierr)
+			return
+		}
+		token, err = itr.Token(ctx)
+	}
+	if err != nil || token == "" {
+		slog.Error("gh.installation_token_error", "delivery", deliveryID, "err", err)
+		return
+	}
+
+	gh := realGH{c: clients.REST}
+	s.processMergedPRWith(ctx, deliveryID, gh, owner, repo, prNum, targetsOverride, token)
+}
+
+// processMergedPRWith contains the core logic and is exercised by unit tests via fakes.
+func (s *Server) processMergedPRWith(
+	ctx context.Context,
+	deliveryID string,
+	gh GH,
+	owner, repo string,
+	prNum int,
+	targetsOverride []string,
+	token string,
+) {
+	// Load PR
+	pr, _, err := gh.PR().Get(ctx, owner, repo, prNum)
 	if err != nil {
 		slog.Error("gh.get_pr_error", "delivery", deliveryID, "repo", owner+"/"+repo, "pr", prNum, "err", err)
 		return
 	}
 
-	// Labels (log for visibility)
-	lbls := []string{}
-	for _, l := range pr.Labels {
-		if l != nil && l.Name != nil {
-			lbls = append(lbls, l.GetName())
-		}
-	}
-	slog.Debug("pr.labels", "delivery", deliveryID, "pr", prNum, "labels", lbls)
-
-	// Target selection
+	// Select targets
 	var targets []string
 	if len(targetsOverride) > 0 {
 		targets = targetsOverride
 	} else {
+		lbls := []string{}
+		for _, l := range pr.Labels {
+			if l != nil && l.Name != nil {
+				lbls = append(lbls, l.GetName())
+			}
+		}
+		slog.Debug("pr.labels", "delivery", deliveryID, "pr", prNum, "labels", lbls)
 		targets = cherry.ParseTargetBranches(pr.Labels)
 	}
 	slog.Info("pr.targets", "delivery", deliveryID, "pr", prNum, "targets", targets)
 	if len(targets) == 0 {
-		slog.Info("pr.no_targets", "delivery", deliveryID, "pr", prNum)
 		return
 	}
 
 	// Determine merged commit SHA
 	mergeSHA := pr.GetMergeCommitSHA()
 	if mergeSHA == "" {
-		commits, _, err := cli.REST.PullRequests.ListCommits(ctx, owner, repo, prNum, &github.ListOptions{PerPage: 250})
+		commits, _, err := gh.PR().ListCommits(ctx, owner, repo, prNum, &github.ListOptions{PerPage: 250})
 		if err != nil || len(commits) == 0 {
-			slog.Error("gh.list_commits_error", "delivery", deliveryID, "pr", prNum, "err", err)
-			if _, _, err2 := cli.REST.Issues.CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+			_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 				Body: github.Ptr(fmt.Sprintf("⚠️ Could not determine merged commit SHA for PR #%d: %v", prNum, err)),
-			}); err2 != nil {
-				slog.Warn("gh.comment_error", "delivery", deliveryID, "stage", "sha_missing", "err", err2)
-			}
+			})
 			return
 		}
 		mergeSHA = commits[len(commits)-1].GetSHA()
 	}
 	slog.Info("pr.merge_sha", "delivery", deliveryID, "pr", prNum, "sha", mergeSHA)
 
-	// Detect if the merged commit is itself a merge (parents > 1)
-	rc, _, err := cli.REST.Repositories.GetCommit(ctx, owner, repo, mergeSHA, nil)
-	if err != nil {
-		slog.Warn("gh.get_commit_warn", "delivery", deliveryID, "sha", mergeSHA, "err", err)
-	}
-	isMerge := rc != nil && len(rc.Parents) > 1
+	// Is the merged commit itself a merge?
+	rc, _, err := gh.Repos().GetCommit(ctx, owner, repo, mergeSHA, nil)
+	isMerge := (err == nil && rc != nil && len(rc.Parents) > 1)
 	if isMerge {
 		slog.Info("pr.merge_sha_is_merge_commit", "delivery", deliveryID, "sha", mergeSHA, "parents", len(rc.Parents))
 	}
 
-	// Installation token for raw git operations
-	itr, err := ghinstallation.New(http.DefaultTransport, s.AppID, installationID, s.PrivateKeyPEM)
-	if err != nil {
-		slog.Error("gh.installation_transport_error", "delivery", deliveryID, "err", err)
-		return
-	}
-	token, err := itr.Token(ctx)
-	if err != nil || token == "" {
-		slog.Error("gh.installation_token_error", "delivery", deliveryID, "err", err)
-		return
-	}
-
-	// Common short SHA for branch naming
+	// For idempotency and branch naming
 	short := mergeSHA
 	if len(short) > 7 {
 		short = mergeSHA[:7]
 	}
 
 	for _, target := range targets {
-		// Ensure target branch exists (full ref)
-		if _, _, err := cli.REST.Git.GetRef(ctx, owner, repo, "refs/heads/"+target); err != nil {
-			slog.Warn("target.missing", "delivery", deliveryID, "target", target)
-			if _, _, err2 := cli.REST.Issues.CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+		// Ensure target branch exists
+		if _, _, err := gh.Git().GetRef(ctx, owner, repo, "refs/heads/"+target); err != nil {
+			_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 				Body: github.Ptr(fmt.Sprintf("⚠️ Target branch `%s` not found; skipping auto cherry-pick.", target)),
-			}); err2 != nil {
-				slog.Warn("gh.comment_error", "delivery", deliveryID, "stage", "target_missing", "err", err2)
-			}
+			})
 			continue
 		}
 
-		// Idempotency: if our work branch already exists, try to find an open PR and skip
 		safeTarget := strings.ReplaceAll(target, "/", "-")
 		workBranch := fmt.Sprintf("autocherry/%s/%s", safeTarget, short)
 
-		if _, _, err := cli.REST.Git.GetRef(ctx, owner, repo, "refs/heads/"+workBranch); err == nil {
-			// Work branch exists; check if there's an open PR head=owner:workBranch base=target
-			prs, _, lerr := cli.REST.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
-				State: "open",
-				Head:  fmt.Sprintf("%s:%s", owner, workBranch),
-				Base:  target,
-				ListOptions: github.ListOptions{
-					PerPage: 1,
-				},
+		// Idempotency: if our work branch already exists, check for an open PR and skip.
+		if _, _, err := gh.Git().GetRef(ctx, owner, repo, "refs/heads/"+workBranch); err == nil {
+			prs, _, _ := gh.PR().List(ctx, owner, repo, &github.PullRequestListOptions{
+				State:       "open",
+				Head:        fmt.Sprintf("%s:%s", owner, workBranch),
+				Base:        target,
+				ListOptions: github.ListOptions{PerPage: 1},
 			})
-			if lerr == nil && len(prs) > 0 {
-				url := prs[0].GetHTMLURL()
-				slog.Info("cherry.already_open", "delivery", deliveryID, "target", target, "branch", workBranch, "url", url)
-				_, _, _ = cli.REST.Issues.CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
-					Body: github.Ptr(fmt.Sprintf("ℹ️ Auto cherry-pick to `%s` is already open: %s", target, url)),
+			if len(prs) > 0 {
+				_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+					Body: github.Ptr(fmt.Sprintf("ℹ️ Auto cherry-pick to `%s` is already open: %s", target, prs[0].GetHTMLURL())),
 				})
 				continue
 			}
-			// Branch exists but no open PR — avoid overwriting; just inform and skip.
-			slog.Info("cherry.branch_exists_no_pr", "delivery", deliveryID, "target", target, "branch", workBranch)
-			_, _, _ = cli.REST.Issues.CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+			_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 				Body: github.Ptr(fmt.Sprintf("ℹ️ Work branch `%s` already exists for `%s`; skipping duplicate cherry-pick.", workBranch, target)),
 			})
 			continue
@@ -245,66 +274,67 @@ func (s *Server) processMergedPR(ctx context.Context, deliveryID string, install
 
 		slog.Info("cherry.start", "delivery", deliveryID, "target", target, "sha", mergeSHA, "isMerge", isMerge)
 
-		var (
-			newWorkBranch string
-			cpErr         error
-		)
-		if isMerge {
-			// Use -m 1: parent 1 is the base branch of the original merge
-			newWorkBranch, cpErr = cherry.DoCherryPickWithMainline(ctx, owner, repo, token, target, mergeSHA, 1, cherry.GitActor{
-				Name:  s.GitUserName,
-				Email: s.GitUserEmail,
-			})
-		} else {
-			newWorkBranch, cpErr = cherry.DoCherryPick(ctx, owner, repo, token, target, mergeSHA, cherry.GitActor{
-				Name:  s.GitUserName,
-				Email: s.GitUserEmail,
-			})
-		}
-
+		// Run cherry-pick via injectable runner
+		workBranchOut, cpErr := s.cherryRunner().Pick(ctx, owner, repo, token, target, mergeSHA, isMerge)
 		if cpErr != nil {
-			// No-op cherry-pick: nothing to apply on this target -> comment and continue.
+			// No-op cherry-pick: nothing to apply on this target
 			if errors.Is(cpErr, cherry.ErrNoopCherryPick) {
-				_, _, _ = cli.REST.Issues.CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+				_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 					Body: github.Ptr(fmt.Sprintf("ℹ️ Auto cherry-pick to `%s`: no changes needed on target (commit already present or empty diff). Skipping PR.", target)),
 				})
 				slog.Info("cherry.noop", "delivery", deliveryID, "target", target, "sha", mergeSHA)
 				continue
 			}
 
-			// Real conflict/error: notify and continue to next target
+			// Real conflict/error
 			slog.Warn("cherry.conflict", "delivery", deliveryID, "target", target, "err", cpErr)
-			if _, _, err2 := cli.REST.Issues.CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+			_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 				Body: github.Ptr(fmt.Sprintf(
 					"⚠️ Auto cherry-pick to `%s` failed. Please create a patch branch from `%s` and cherry-pick `%s` manually.\n\nDetails: `%v`",
 					target, target, mergeSHA, cpErr)),
-			}); err2 != nil {
-				slog.Warn("gh.comment_error", "delivery", deliveryID, "stage", "conflict", "err", err2)
-			}
+			})
 			continue
 		}
 
-		slog.Info("cherry.pushed", "delivery", deliveryID, "work_branch", newWorkBranch, "target", target)
+		slog.Info("cherry.pushed", "delivery", deliveryID, "work_branch", workBranchOut, "target", target)
 
 		// Open PR into target
 		title := fmt.Sprintf("Auto cherry-pick: PR #%d — %s", pr.GetNumber(), pr.GetTitle())
 		body := fmt.Sprintf("Automated cherry-pick of PR #%d into `%s`.\n\nCommit: `%s`", pr.GetNumber(), target, mergeSHA)
-		newPR, _, err := cli.REST.PullRequests.Create(ctx, owner, repo, &github.NewPullRequest{
+		newPR, _, err := gh.PR().Create(ctx, owner, repo, &github.NewPullRequest{
 			Title: github.Ptr(title),
-			Head:  github.Ptr(newWorkBranch),
+			Head:  github.Ptr(workBranchOut),
 			Base:  github.Ptr(target),
 			Body:  github.Ptr(body),
 		})
 		if err != nil {
 			slog.Error("gh.create_pr_error", "delivery", deliveryID, "target", target, "err", err)
+			_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+				Body: github.Ptr(fmt.Sprintf("⚠️ Auto cherry-pick to `%s`: failed to open PR: %v", target, err)),
+			})
 			continue
 		}
 		slog.Info("gh.pr_opened", "delivery", deliveryID, "url", newPR.GetHTMLURL(), "target", target)
 
-		if _, _, err2 := cli.REST.Issues.CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+		_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 			Body: github.Ptr(fmt.Sprintf("✅ Auto cherry-pick opened: %s", newPR.GetHTMLURL())),
-		}); err2 != nil {
-			slog.Warn("gh.comment_error", "delivery", deliveryID, "stage", "announce", "err", err2)
-		}
+		})
 	}
+}
+
+// ---- Cherry-pick runner seam ----
+
+type CherryPickRunner interface {
+	Pick(ctx context.Context, owner, repo, token, target, sha string, isMerge bool) (workBranch string, err error)
+}
+
+type realCherryRunner struct {
+	actor cherry.GitActor
+}
+
+func (r realCherryRunner) Pick(ctx context.Context, owner, repo, token, target, sha string, isMerge bool) (string, error) {
+	if isMerge {
+		return cherry.DoCherryPickWithMainline(ctx, owner, repo, token, target, sha, 1, r.actor)
+	}
+	return cherry.DoCherryPick(ctx, owner, repo, token, target, sha, r.actor)
 }
