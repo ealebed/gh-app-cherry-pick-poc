@@ -317,7 +317,7 @@ func (s *Server) processMergedPRWith(
 		slog.Info("gh.pr_opened", "delivery", deliveryID, "url", newPR.GetHTMLURL(), "target", target)
 
 		_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
-			Body: github.Ptr(fmt.Sprintf("✅ Auto cherry-pick opened: %s", newPR.GetHTMLURL())),
+			Body: github.Ptr(fmt.Sprintf("✅ Auto cherry-pick to `%s` opened: %s", target, newPR.GetHTMLURL())),
 		})
 	}
 }
