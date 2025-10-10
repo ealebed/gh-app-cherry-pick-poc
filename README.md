@@ -25,6 +25,11 @@ Idempotent behaviors:
 - If a work branch/PR for that target already exists, the app comments that it’s already open.
 - If the cherry-pick is a no-op (commit already present / empty diff), it comments and skips opening a PR.
 
+3. Auto-create label when a new release branch is created (pattern: `<team>-release/NNNN` leads to creation label `cherry-pick to <branch>`).
+4. Retention: keep only the latest 5 labels per team and delete older ones.
+5. Repo label cascade deletion: when we delete labels (as part of retention), we’ll first remove them from PRs; users deleting labels in GitHub UI are already handled by GitHub (labels disappear from PRs).
+6. Unlabel on "initial" PR leads to retracting autocherry PR: removing a `cherry-pick to ...` label closes the corresponding child cherry-pick PR (if open) and deletes the work branch.
+
 Was inspired with this [article](https://www.linkedin.com/blog/engineering/developer-experience-productivity/how-linkedin-automates-cherry-picking-commits-to-improve-develop).
 
 ---
@@ -35,14 +40,17 @@ Was inspired with this [article](https://www.linkedin.com/blog/engineering/devel
 
 - **Name**: `ealebed-cherry-pick-poc` (or any name you prefer).
 - **Permissions** (Repository):
-  - **Contents**: Read & write  
-  - **Pull requests**: Read & write  
-  - **Issues**: Read & write  
-  - **Metadata**: Read
+  - **Contents**: Read & write (push branches, delete refs)
+  - **Pull requests**: Read & write (open/close PRs, comment)
+  - **Issues**: Read & write (create/delete labels, add/remove labels on PRs)
+  - **Metadata**: Read (default)
 - **Webhook**:
   - **URL**: `https://<your-app-host>/webhook`
   - **Secret**: set a strong random value (you’ll reuse it as `GITHUB_WEBHOOK_SECRET`)
-  - **Subscribe to events**: `pull_request`, `issue_comment`
+  - **Subscribe to events**:
+    - `pull_request` (Pull request assigned, auto merge disabled, auto merge enabled, closed, converted to draft, demilestoned, dequeued, edited, enqueued, labeled, locked, milestoned, opened, ready for review, reopened, review request removed, review requested, synchronized, unassigned, unlabeled, or unlocked)
+    - `issue_comment` (Issue comment created, edited, or deleted)
+    - `create` (Branch or tag created)
 - **Private key**: Generate and download the **PEM** for the app.
 
 Install the app on the repositories where you want auto cherry-picks.
@@ -66,7 +74,7 @@ If a labeled branch doesn’t exist, the app comments and skips that target.
 - `GITHUB_APP_ID` — your GitHub App ID (integer)
 - `GITHUB_WEBHOOK_SECRET` — the webhook secret you set in the app
 - **Provide the app private key via one of:**
-  - `GITHUB_APP_PRIVATE_KEY_PEM_BASE64` — **base64** of the PEM contents  
+  - `GITHUB_APP_PRIVATE_KEY_PEM_BASE64` — **base64** of the PEM contents
   - `GITHUB_APP_PRIVATE_KEY_PEM` — raw PEM contents (if you’ve wired it this way)
 
 ---
@@ -213,7 +221,7 @@ gcloud run deploy "${SERVICE}" \
 **Notes:**
 
 - `--allow-unauthenticated` makes the service publicly callable (signature verification still protects you). If your org policy forbids public services, you’ll need to change that or front with an alternative—but for GitHub webhooks, public access is standard.
-- `--min-instances=1` avoids cold start delays so GitHub doesn’t retry webhooks. Tune `max-instances` to your traffic/budget. 
+- `--min-instances=1` avoids cold start delays so GitHub doesn’t retry webhooks. Tune `max-instances` to your traffic/budget.
 
 ### 4) Set the GitHub App webhook URL
 

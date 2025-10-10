@@ -11,6 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -66,6 +68,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("webhook.received", "delivery", deliveryID, "event", event)
 
 	switch event {
+
 	case "pull_request":
 		var e github.PullRequestEvent
 		if err := json.Unmarshal(body, &e); err != nil {
@@ -81,6 +84,66 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}()
 			s.handlePREvent(context.Background(), deliveryID, &e)
+		}()
+		w.WriteHeader(http.StatusAccepted)
+
+	case "create":
+		// Auto-create labels when a release branch is created; also enforce retention.
+		var e github.CreateEvent
+		if err := json.Unmarshal(body, &e); err != nil {
+			slog.Error("webhook.bad_payload", "delivery", deliveryID, "err", err)
+			http.Error(w, "bad payload", http.StatusBadRequest)
+			return
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			s.handleCreateEvent(ctx, deliveryID, &e)
+		}()
+		w.WriteHeader(http.StatusAccepted)
+
+	case "label":
+		// If a "cherry-pick to <branch>" label is deleted at repo level,
+		// remove that label from all open PRs.
+		var e github.LabelEvent
+		if err := json.Unmarshal(body, &e); err != nil {
+			slog.Error("webhook.bad_payload", "delivery", deliveryID, "err", err)
+			http.Error(w, "bad payload", http.StatusBadRequest)
+			return
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			// LabelEvent has Repo
+			if e.GetAction() != "deleted" || e.GetRepo() == nil || e.GetLabel() == nil {
+				return
+			}
+			repo := e.GetRepo()
+			owner, name := repo.GetOwner().GetLogin(), repo.GetName()
+			labelName := e.GetLabel().GetName()
+
+			if !strings.HasPrefix(labelName, "cherry-pick to ") {
+				return
+			}
+
+			// Need an installation to act
+			inst := e.GetInstallation()
+			if inst == nil {
+				slog.Warn("label.no_installation", "delivery", deliveryID, "repo", owner+"/"+name)
+				return
+			}
+			clients, err := s.buildClients(inst.GetID())
+			if err != nil {
+				slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
+				return
+			}
+			gh := realGH{c: clients.REST}
+
+			if err := s.removeLabelFromOpenPRs(ctx, gh, owner, name, labelName); err != nil {
+				slog.Error("labels.remove_from_open_prs_error", "delivery", deliveryID, "err", err, "label", labelName)
+			} else {
+				slog.Info("labels.removed_from_open_prs", "delivery", deliveryID, "label", labelName)
+			}
 		}()
 		w.WriteHeader(http.StatusAccepted)
 
@@ -118,12 +181,58 @@ func (s *Server) handlePREvent(ctx context.Context, deliveryID string, e *github
 		targetsOverride = cherry.ParseTargetBranches([]*github.Label{e.Label})
 	}
 
-	// We act on merged PRs, and also on label-added events for PRs that are already merged.
-	if (action == "closed" && merged) || (action == "labeled" && merged) {
+	switch {
+	// Create cherry-pick PRs on merge or labeled-after-merge.
+	case (action == "closed" && merged) || (action == "labeled" && merged):
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer cancel()
 		s.processMergedPR(cctx, deliveryID, instID, owner, name, prNum, targetsOverride)
-	} else {
+
+	// If a label is removed from a merged PR, close the autocherry PR and delete the work branch.
+	case action == "unlabeled" && merged && e.Label != nil:
+		targets := cherry.ParseTargetBranches([]*github.Label{e.Label})
+		if len(targets) == 0 {
+			return
+		}
+		clients, err := s.buildClients(instID)
+		if err != nil {
+			slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
+			return
+		}
+		gh := realGH{c: clients.REST}
+
+		// Determine the merge SHA (same logic as processMergedPRWith)
+		pr, _, err := gh.PR().Get(ctx, owner, name, prNum)
+		if err != nil {
+			return
+		}
+		mergeSHA := pr.GetMergeCommitSHA()
+		if mergeSHA == "" {
+			commits, _, _ := gh.PR().ListCommits(ctx, owner, name, prNum, &github.ListOptions{PerPage: 250})
+			if len(commits) > 0 {
+				mergeSHA = commits[len(commits)-1].GetSHA()
+			}
+		}
+		if mergeSHA == "" {
+			return
+		}
+		short := mergeSHA
+		if len(short) > 7 {
+			short = mergeSHA[:7]
+		}
+
+		for _, target := range targets {
+			safeTarget := strings.ReplaceAll(target, "/", "-")
+			workBranch := fmt.Sprintf("autocherry/%s/%s", safeTarget, short)
+			if err := s.processUnlabeled(ctx, gh, owner, name, prNum, target, workBranch); err != nil {
+				slog.Error("unlabeled.cleanup_error", "delivery", deliveryID, "target", target, "err", err)
+			} else {
+				_, _, _ = gh.Issues().CreateComment(ctx, owner, name, prNum, &github.IssueComment{
+					Body: github.Ptr(fmt.Sprintf("ℹ️ Removed label for `%s`: closed any open auto-cherry-pick PR and deleted work branch `%s`.", target, workBranch)),
+				})
+			}
+		}
+	default:
 		slog.Debug("pr.skip", "delivery", deliveryID, "reason", "not_merged_or_not_labeled_after_merge")
 	}
 }
@@ -141,22 +250,13 @@ func (s *Server) cherryRunner() CherryPickRunner {
 // processMergedPR keeps the production path (creating real clients/token) then
 // delegates to processMergedPRWith which is fully testable via injected fakes.
 func (s *Server) processMergedPR(ctx context.Context, deliveryID string, installationID int64, owner, repo string, prNum int, targetsOverride []string) {
-	// Build real clients (or injected)
-	var (
-		clients *githubapp.Clients
-		err     error
-	)
-	if s.NewClients != nil {
-		clients, err = s.NewClients(s.AppID, installationID, s.PrivateKeyPEM)
-	} else {
-		clients, err = githubapp.NewClients(s.AppID, installationID, s.PrivateKeyPEM)
-	}
+	clients, err := s.buildClients(installationID)
 	if err != nil {
 		slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
 		return
 	}
 
-	// Get an installation token (or injected)
+	// Installation token for git push via HTTPS.
 	var token string
 	if s.GetToken != nil {
 		token, err = s.GetToken(ctx, s.AppID, installationID, s.PrivateKeyPEM)
@@ -175,6 +275,13 @@ func (s *Server) processMergedPR(ctx context.Context, deliveryID string, install
 
 	gh := realGH{c: clients.REST}
 	s.processMergedPRWith(ctx, deliveryID, gh, owner, repo, prNum, targetsOverride, token)
+}
+
+func (s *Server) buildClients(installationID int64) (*githubapp.Clients, error) {
+	if s.NewClients != nil {
+		return s.NewClients(s.AppID, installationID, s.PrivateKeyPEM)
+	}
+	return githubapp.NewClients(s.AppID, installationID, s.PrivateKeyPEM)
 }
 
 // processMergedPRWith contains the core logic and is exercised by unit tests via fakes.
@@ -320,6 +427,186 @@ func (s *Server) processMergedPRWith(
 			Body: github.Ptr(fmt.Sprintf("✅ Auto cherry-pick to `%s` opened: %s", target, newPR.GetHTMLURL())),
 		})
 	}
+}
+
+// ---------- Branch create: auto-label + retention ----------
+
+func (s *Server) handleCreateEvent(ctx context.Context, deliveryID string, e *github.CreateEvent) {
+	if e.GetRefType() != "branch" || e.GetRepo() == nil {
+		return
+	}
+	ref := e.GetRef() // branch name
+	repo := e.GetRepo()
+	owner, name := repo.GetOwner().GetLogin(), repo.GetName()
+
+	// Match "<team>-release/NNNN"
+	re := regexp.MustCompile(`^([a-z0-9-]+-release)/(\d{4})$`)
+	m := re.FindStringSubmatch(ref)
+	if len(m) != 3 {
+		slog.Debug("create.ignore_branch", "delivery", deliveryID, "ref", ref)
+		return
+	}
+
+	inst := e.GetInstallation()
+	if inst == nil {
+		slog.Warn("create.no_installation", "delivery", deliveryID, "repo", owner+"/"+name)
+		return
+	}
+	clients, err := s.buildClients(inst.GetID())
+	if err != nil {
+		slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
+		return
+	}
+	gh := realGH{c: clients.REST}
+
+	label := "cherry-pick to " + ref
+	if err := s.ensureLabel(ctx, gh, owner, name, label); err != nil {
+		slog.Error("labels.ensure_error", "delivery", deliveryID, "label", label, "err", err)
+	} else {
+		slog.Info("labels.created_or_exists", "delivery", deliveryID, "label", label)
+	}
+
+	// Retain only latest 5 labels per family (e.g., devops-release).
+	if err := s.enforceLabelRetention(ctx, gh, owner, name, 5); err != nil {
+		slog.Error("labels.retention_error", "delivery", deliveryID, "err", err)
+	}
+}
+
+// --- Label & cleanup helpers ---
+
+func (s *Server) ensureLabel(ctx context.Context, gh GH, owner, repo, name string) error {
+	labels, _, err := gh.Issues().ListLabels(ctx, owner, repo, &github.ListOptions{PerPage: 100})
+	if err != nil {
+		return fmt.Errorf("list repo labels: %w", err)
+	}
+	for _, l := range labels {
+		if l != nil && l.Name != nil && l.GetName() == name {
+			return nil
+		}
+	}
+	_, _, err = gh.Issues().CreateLabel(ctx, owner, repo, &github.Label{
+		Name:  github.Ptr(name),
+		Color: github.Ptr("ededed"),
+	})
+	return err
+}
+
+func (s *Server) enforceLabelRetention(ctx context.Context, gh GH, owner, repo string, keep int) error {
+	if keep <= 0 {
+		return nil
+	}
+	labels, _, err := gh.Issues().ListLabels(ctx, owner, repo, &github.ListOptions{PerPage: 200})
+	if err != nil {
+		return err
+	}
+
+	re := regexp.MustCompile(`^cherry-pick to ([a-z0-9-]+-release)/(\d+)$`)
+	type item struct {
+		full string
+		fam  string
+		n    int
+	}
+	buckets := map[string][]item{}
+
+	for _, l := range labels {
+		if l == nil || l.Name == nil {
+			continue
+		}
+		name := l.GetName()
+		m := re.FindStringSubmatch(name)
+		if len(m) != 3 {
+			continue
+		}
+		fam := m[1]           // e.g. devops-release
+		num := parseInt(m[2]) // numeric suffix
+		if num < 0 {
+			continue
+		}
+		buckets[fam] = append(buckets[fam], item{full: name, fam: fam, n: num})
+	}
+
+	for fam, items := range buckets {
+		sort.Slice(items, func(i, j int) bool { return items[i].n < items[j].n })
+		if len(items) <= keep {
+			continue
+		}
+		toDelete := items[0 : len(items)-keep]
+		for _, it := range toDelete {
+			_, _ = gh.Issues().DeleteLabel(ctx, owner, repo, it.full)
+		}
+		slog.Debug("labels.retained", "family", fam, "kept", keep, "deleted", len(toDelete))
+	}
+	return nil
+}
+
+func (s *Server) removeLabelFromOpenPRs(ctx context.Context, gh GH, owner, repo, label string) error {
+	issues, _, err := gh.Issues().ListByRepo(ctx, owner, repo, &github.IssueListByRepoOptions{
+		State:       "open",
+		Labels:      []string{label},
+		ListOptions: github.ListOptions{PerPage: 100},
+	})
+	if err != nil {
+		return err
+	}
+	for _, is := range issues {
+		if is == nil || is.Number == nil {
+			continue
+		}
+		_, _ = gh.Issues().RemoveLabelForIssue(ctx, owner, repo, is.GetNumber(), label)
+	}
+	return nil
+}
+
+// processUnlabeled closes the autocherry PR (if open) and deletes the work branch.
+func (s *Server) processUnlabeled(ctx context.Context, gh GH, owner, repo string, mainPRNumber int, target, workBranch string) error {
+	// Find open PRs from workBranch -> target.
+	prs, _, err := gh.PR().List(ctx, owner, repo, &github.PullRequestListOptions{
+		State:       "open",
+		Base:        target,
+		Head:        owner + ":" + workBranch,
+		ListOptions: github.ListOptions{PerPage: 50},
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, pr := range prs {
+		if pr == nil || pr.Number == nil {
+			continue
+		}
+		_, _, _ = gh.PR().Edit(ctx, owner, repo, pr.GetNumber(), &github.PullRequest{
+			State: github.Ptr("closed"),
+		})
+	}
+
+	_, derr := gh.Git().DeleteRef(ctx, owner, repo, "refs/heads/"+workBranch)
+	if derr != nil && !isNotFound(derr) {
+		return derr
+	}
+	return nil
+}
+
+// parseInt best-effort atoi; returns -1 on error.
+func parseInt(s string) int {
+	n := 0
+	if s == "" {
+		return -1
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return -1
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
+func isNotFound(err error) bool {
+	var e *github.ErrorResponse
+	if errors.As(err, &e) && e.Response != nil && e.Response.StatusCode == http.StatusNotFound {
+		return true
+	}
+	return false
 }
 
 // ---- Cherry-pick runner seam ----
