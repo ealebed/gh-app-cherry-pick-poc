@@ -4,9 +4,9 @@ resource "aws_sqs_queue" "dlq" {
 }
 
 resource "aws_sqs_queue" "main" {
-  name                      = "ghapp-poc-queue"
+  name                       = "ghapp-poc-queue"
   visibility_timeout_seconds = 60
-  message_retention_seconds  = 345600  # 4 days
+  message_retention_seconds  = 345600 # 4 days
   receive_wait_time_seconds  = 10
 
   redrive_policy = jsonencode({

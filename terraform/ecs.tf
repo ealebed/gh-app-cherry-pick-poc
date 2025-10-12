@@ -15,9 +15,9 @@ resource "aws_iam_role" "ecs_execution" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
+      Effect    = "Allow",
       Principal = { Service = "ecs-tasks.amazonaws.com" },
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -33,9 +33,9 @@ resource "aws_iam_role" "ecs_task" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
+      Effect    = "Allow",
       Principal = { Service = "ecs-tasks.amazonaws.com" },
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -46,8 +46,8 @@ resource "aws_iam_role_policy" "ecs_task_sqs" {
   policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect   = "Allow",
-      Action   = [
+      Effect = "Allow",
+      Action = [
         "sqs:GetQueueUrl",
         "sqs:ReceiveMessage",
         "sqs:DeleteMessage",
@@ -59,12 +59,33 @@ resource "aws_iam_role_policy" "ecs_task_sqs" {
   })
 }
 
+# IAM policy that allows the ECS *execution role* to fetch those secrets
+resource "aws_iam_policy" "ecs_exec_read_secrets" {
+  name = "ghapp-poc-ecs-exec-read-secrets"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Action = ["secretsmanager:GetSecretValue"],
+      Resource = [
+        data.aws_secretsmanager_secret.webhook_secret.arn,
+        data.aws_secretsmanager_secret.github_key_b64.arn
+      ]
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_exec_read_secrets" {
+  role       = aws_iam_role.ecs_execution.name
+  policy_arn = aws_iam_policy.ecs_exec_read_secrets.arn
+}
+
 resource "aws_ecs_task_definition" "worker" {
   family                   = "ghapp-poc-worker"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = 256
-  memory                   = 512
+  cpu                      = 512
+  memory                   = 1024
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
@@ -74,8 +95,21 @@ resource "aws_ecs_task_definition" "worker" {
       image     = var.worker_image,
       essential = true,
       environment = [
-        { name = "QUEUE_URL", value = aws_sqs_queue.main.id },
-        { name = "AWS_REGION", value = var.aws_region }
+        { name = "AWS_REGION", value = var.aws_region },
+        { name = "SQS_QUEUE_URL", value = aws_sqs_queue.main.id },
+        { name = "SQS_MAX_MESSAGES", value = "10" },
+        { name = "SQS_WAIT_TIME_SECONDS", value = "10" },
+        { name = "SQS_VISIBILITY_TIMEOUT", value = "120" },
+        { name = "SQS_DELETE_ON_4XX", value = "true" },
+        { name = "LISTEN_PORT", value = ":8080" },
+        { name = "LOG_LEVEL", value = "info" },
+        { name = "GIT_USER_NAME", value = "cherry-pick-bot" },
+        { name = "GIT_USER_EMAIL", value = "cherry-pick-bot@users.noreply.github.com" },
+        { name = "GITHUB_APP_ID", value = "2077471" },
+      ],
+      secrets = [
+        { name = "GITHUB_WEBHOOK_SECRET", valueFrom = data.aws_secretsmanager_secret.webhook_secret.arn },
+        { name = "GITHUB_APP_PRIVATE_KEY_PEM_BASE64", valueFrom = data.aws_secretsmanager_secret.github_key_b64.arn }
       ],
       logConfiguration = {
         logDriver = "awslogs",
@@ -84,6 +118,13 @@ resource "aws_ecs_task_definition" "worker" {
           awslogs-region        = var.aws_region,
           awslogs-stream-prefix = "ecs"
         }
+      },
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz >/dev/null"]
+        interval    = 10
+        timeout     = 5
+        retries     = 3
+        startPeriod = 5
       }
     }
   ])
@@ -97,8 +138,8 @@ resource "aws_ecs_service" "worker" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets         = [aws_subnet.public_a.id, aws_subnet.public_b.id]
-    security_groups = [aws_security_group.ecs_tasks.id]
+    subnets          = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+    security_groups  = [aws_security_group.ecs_tasks.id]
     assign_public_ip = true
   }
 
