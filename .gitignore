@@ -18,3 +18,15 @@
 **/.DS_Store
 **/debug
 **/debug.test
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.*
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+terraform.tfvars
+.terraform.lock.hcl
