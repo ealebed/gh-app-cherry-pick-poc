@@ -6,7 +6,7 @@ resource "aws_vpc" "main" {
   cidr_block           = "10.10.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
-  tags = { Name = "ghapp-poc-vpc" }
+  tags                 = { Name = "ghapp-poc-vpc" }
 }
 
 resource "aws_internet_gateway" "igw" {
@@ -28,7 +28,7 @@ resource "aws_subnet" "public_a" {
   cidr_block              = "10.10.1.0/24"
   availability_zone       = local.azs[0]
   map_public_ip_on_launch = true
-  tags = { Name = "ghapp-poc-public-a" }
+  tags                    = { Name = "ghapp-poc-public-a" }
 }
 
 resource "aws_subnet" "public_b" {
@@ -36,7 +36,7 @@ resource "aws_subnet" "public_b" {
   cidr_block              = "10.10.2.0/24"
   availability_zone       = local.azs[1]
   map_public_ip_on_launch = true
-  tags = { Name = "ghapp-poc-public-b" }
+  tags                    = { Name = "ghapp-poc-public-b" }
 }
 
 resource "aws_route_table_association" "public_a" {

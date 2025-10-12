@@ -20,6 +20,6 @@ output "dlq_queue_url" {
 }
 
 output "webhook_url" {
-  value = "https://${aws_api_gateway_rest_api.webhook.id}.execute-api.${var.aws_region}.amazonaws.com/${aws_api_gateway_stage.dev.stage_name}/webhook"
+  value       = "https://${aws_api_gateway_rest_api.webhook.id}.execute-api.${var.aws_region}.amazonaws.com/${aws_api_gateway_stage.dev.stage_name}/webhook"
   description = "Use this as the GitHub Webhook URL"
 }
