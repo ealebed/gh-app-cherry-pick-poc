@@ -67,10 +67,16 @@ Examples:
 
 If a labeled branch doesn’t exist, the app comments and skips that target.
 
-### 3) Environment variables (for the server)
+### 3) Environment variables (for the application)
 
-- `LISTEN_PORT` — optional (default `8080`)
+- `LISTEN_PORT` — optional (default `:8080`)
 - `LOG_LEVEL` - optional (default `info`)
+- `SQS_QUEUE_URL` - еhe full URL of the main SQS queue the worker will poll
+- `SQS_MAX_MESSAGES` - optional (default `10`)
+- `SQS_WAIT_TIME_SECONDS` - optional (default `10`)
+- `SQS_VISIBILITY_TIMEOUT` - optional (default `120`)
+- `SQS_DELETE_ON_4XX` - optional (default `true`)
+- `AWS_REGION` - optional (default `eu-north-1`)
 - `GITHUB_APP_ID` — your GitHub App ID (integer)
 - `GITHUB_WEBHOOK_SECRET` — the webhook secret you set in the app
 - **Provide the app private key via one of:**
@@ -93,14 +99,23 @@ Create `.env` (or export vars directly):
 GITHUB_APP_ID=123456
 GITHUB_WEBHOOK_SECRET=your-very-secret-string
 GITHUB_APP_PRIVATE_KEY_PEM_BASE64=<<<paste base64 of your PEM here>>>
-LISTEN_PORT=8080
+LISTEN_PORT=:8080
 LOG_LEVEL=debug
+AWS_REGION=eu-north-1
+SQS_QUEUE_URL=https://sqs.eu-north-1.amazonaws.com/531438381462/ghapp-poc-queue
+SQS_MAX_MESSAGES=10
+SQS_WAIT_TIME_SECONDS=10
+SQS_VISIBILITY_TIMEOUT=120
+SQS_DELETE_ON_4XX=true
 ```
 
-### 2) Run the server
+### 2) Run the application
 ```bash
 go run ./cmd/server
 ```
+
+> Health check is at `GET /healthz`. The worker consumes from `SQS_QUEUE_URL`.
+
 
 ### 3) Expose locally via ngrok
 ```bash
@@ -306,6 +321,87 @@ http(s)://<external-address>/webhook
 > **HTTPS recommended:** If your LB doesn’t terminate TLS, add an Ingress (e.g., NGINX + cert-manager) to get an HTTPS hostname and point the webhook there.
 
 ### 5) Test the flow
+
+---
+
+## Deploying to AWS (API Gateway → SQS → ECS/Fargate)
+
+This repository includes Terraform to provision:
+- API Gateway (REST) endpoint /webhook that forwards GitHub payloads to SQS.
+- SQS main queue (+ DLQ) for decoupling and retries.
+- ECS Fargate service that runs the worker (SQS poller), with logs to CloudWatch.
+- IAM roles/policies for API Gateway → SQS, and ECS task permissions.
+
+### Prerequisites
+
+- AWS account + credentials exported as env vars:
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=eu-north-1
+```
+
+- Terraform `>= 1.6`, AWS provider `~> 5.0`.
+- Your container image (see `variables.tf` `worker_image`). Defaults to: `docker.io/ealebed/cherrypicker:2025.10.10-11.50`
+
+### 1) Create Secrets in AWS Secrets Manager
+
+We store:
+- `GITHUB_WEBHOOK_SECRET` — plain string
+- `GITHUB_APP_PRIVATE_KEY_PEM_BASE64` — base64 of your GitHub App PEM
+
+Example (names match Terraform data sources):
+```bash
+# Webhook secret (plain)
+aws secretsmanager create-secret \
+  --name ghapp/webhook_secret \
+  --secret-string 'your-webhook-secret-value'
+
+# PEM -> base64 (single-line). On macOS:
+base64 -i /path/to/app-private-key.pem | tr -d '\n' > /tmp/appkey.b64
+
+# Private key (base64 string)
+aws secretsmanager create-secret \
+  --name ghapp/private_key_pem_b64 \
+  --secret-string "$(cat /tmp/appkey.b64)"
+```
+
+> Terraform reads these with data sources (`data "aws_secretsmanager_secret" ...`) and grants the ECS execution role `secretsmanager:GetSecretValue` to inject them into the container environment.
+
+### 2) Review / set the image tag (optional)
+Edit variables.tf if you want a different image:
+```bash
+variable "worker_image" {
+  default = "docker.io/youruser/yourimage:yourtag"
+}
+```
+
+### 3) Provision infra with Terraform
+
+From the `terraform` repo folder:
+```bash
+terraform init
+terraform apply -auto-approve
+```
+
+Key outputs:
+- `webhook_url` — Use this as the GitHub App Webhook URL
+Example: `https://{api-id}.execute-api.{region}.amazonaws.com/dev/webhook`
+- `sqs_queue_url` — The worker reads from this queue
+
+### 4) Configure your GitHub App webhook
+In your GitHub App settings:
+
+- Set Webhook URL to the Terraform output `webhook_url`.
+- Set the secret to the same value you stored in Secrets Manager (`ghapp/webhook_secret`).
+
+### 5) Verify the ECS worker is healthy
+
+- ECS Service: `ghapp-poc-worker`
+- Health check hits `GET /healthz` (we use `curl` in the task definition).
+- Logs are in CloudWatch Logs group `/ecs/ghapp-poc-worker`
+
+### 6) Test the flow end-to-end
 
 ---
 

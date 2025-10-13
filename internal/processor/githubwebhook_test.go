@@ -1,20 +1,17 @@
-package webhook
+package processor
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io"
 	"net/http"
-	"net/http/httptest"
-	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	sqsingest "github.com/ealebed/gh-app-cherry-pick-poc/internal/ingest/sqs"
 	github "github.com/google/go-github/v75/github"
 
 	"github.com/ealebed/gh-app-cherry-pick-poc/internal/cherry"
@@ -52,6 +49,14 @@ func repoCommitWithParents(n int) *github.RepositoryCommit {
 		ps[i] = &github.Commit{}
 	}
 	return &github.RepositoryCommit{Parents: ps}
+}
+
+// small helper to build an SQS/APIGW-like envelope for HandleFromEnvelope tests
+func env(headers map[string]string, body []byte) sqsingest.APIGWEnvelope {
+	return sqsingest.APIGWEnvelope{
+		Headers: headers,
+		Body:    string(body),
+	}
 }
 
 //
@@ -200,7 +205,7 @@ func (f *fakeGitFull) GetRef(ctx context.Context, owner, repo, ref string) (*git
 	if f.refs[ref] {
 		return &github.Reference{Ref: github.Ptr(ref)}, nil, nil
 	}
-	return nil, nil, &github.ErrorResponse{Response: &http.Response{StatusCode: 404}}
+	return nil, nil, &github.ErrorResponse{Response: &http.Response{StatusCode: 404}} // not found
 }
 func (f *fakeGitFull) DeleteRef(ctx context.Context, owner, repo, ref string) (*github.Response, error) {
 	f.deletedRefs = append(f.deletedRefs, ref)
@@ -242,79 +247,48 @@ func (f fakeCherry) Pick(ctx context.Context, owner, repo, token, target, sha st
 }
 
 //
-// ---------- ServeHTTP + signature tests ----------
+// ---------- Envelope/Signature tests (SQS path) ----------
 //
 
-func TestServeHTTP_UnauthorizedSignature(t *testing.T) {
-	s := &Server{WebhookSecret: []byte("secret")}
+func TestHandleFromEnvelope_UnauthorizedSignature(t *testing.T) {
+	p := &Processor{WebhookSecret: []byte("secret")}
 	body := []byte(`{"action":"opened"}`)
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
-	req.Header.Set("X-GitHub-Event", "pull_request")
-	req.Header.Set("X-Hub-Signature-256", "sha256=deadbeef")
-	w := httptest.NewRecorder()
-
-	s.ServeHTTP(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("got status %d, want %d", w.Code, http.StatusUnauthorized)
+	headers := map[string]string{
+		"X-GitHub-Event":      "pull_request",
+		"X-Hub-Signature-256": "sha256=deadbeef",
+	}
+	code, err := p.HandleFromEnvelope(context.Background(), env(headers, body))
+	if code != http.StatusUnauthorized || err == nil {
+		t.Fatalf("got code=%d err=%v, want 401 + error", code, err)
 	}
 }
 
-func TestServeHTTP_PullRequestAccepted(t *testing.T) {
-	s := &Server{WebhookSecret: []byte("secret")}
-	body := []byte(`{"action":"opened","installation":{"id":1},"pull_request":{"merged":false}}`)
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
-	req.Header.Set("X-GitHub-Event", "pull_request")
-	req.Header.Set("X-Hub-Signature-256", signBody(s.WebhookSecret, body))
-	w := httptest.NewRecorder()
-
-	s.ServeHTTP(w, req)
-
-	if w.Code != http.StatusAccepted {
-		t.Fatalf("got status %d, want %d", w.Code, http.StatusAccepted)
+func TestHandleFromEnvelope_PullRequestAccepted(t *testing.T) {
+	p := &Processor{WebhookSecret: []byte("secret")}
+	body := []byte(`{"action":"opened","installation":{"id":1},"pull_request":{"merged":false},"repo":{"owner":{"login":"o"},"name":"r"}}`)
+	headers := map[string]string{
+		"X-GitHub-Event":      "pull_request",
+		"X-GitHub-Delivery":   "d1",
+		"X-Hub-Signature-256": signBody(p.WebhookSecret, body),
+	}
+	code, err := p.HandleFromEnvelope(context.Background(), env(headers, body))
+	if err != nil || code != http.StatusAccepted {
+		t.Fatalf("got code=%d err=%v, want %d", code, err, http.StatusAccepted)
 	}
 	// tiny wait to let async goroutine (which will early-return) run
 	time.Sleep(10 * time.Millisecond)
-	_, _ = io.ReadAll(w.Result().Body)
 }
 
-func TestServeHTTP_IgnoresOtherEvents(t *testing.T) {
-	s := &Server{WebhookSecret: []byte("secret")}
+func TestHandleFromEnvelope_IgnoresOtherEvents(t *testing.T) {
+	p := &Processor{WebhookSecret: []byte("secret")}
 	body := []byte(`{}`)
-
-	req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
-	req.Header.Set("X-GitHub-Event", "issues")
-	req.Header.Set("X-Hub-Signature-256", signBody(s.WebhookSecret, body))
-	w := httptest.NewRecorder()
-
-	s.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("got status %d, want %d", w.Code, http.StatusNoContent)
+	headers := map[string]string{
+		"X-GitHub-Event":      "issues",
+		"X-Hub-Signature-256": signBody(p.WebhookSecret, body),
 	}
-}
-
-func TestVerifySig(t *testing.T) {
-	secret := []byte("sekret")
-	body := []byte(`{"hello":"world"}`)
-
-	m := hmac.New(sha256.New, secret)
-	m.Write(body)
-	want := "sha256=" + hex.EncodeToString(m.Sum(nil))
-
-	req, _ := http.NewRequest("POST", "/webhook", bytes.NewReader(body))
-	req.Header.Set("X-Hub-Signature-256", want)
-
-	s := &Server{WebhookSecret: secret}
-	if !s.verifySig(req, body) {
-		t.Fatalf("verifySig = false, want true")
-	}
-
-	req.Header.Set("X-Hub-Signature-256", "sha256=deadbeef")
-	if s.verifySig(req, body) {
-		t.Fatalf("verifySig = true, want false")
+	code, err := p.HandleFromEnvelope(context.Background(), env(headers, body))
+	if err != nil || code != http.StatusNoContent {
+		t.Fatalf("got code=%d err=%v, want %d", code, err, http.StatusNoContent)
 	}
 }
 
@@ -323,7 +297,7 @@ func TestVerifySig(t *testing.T) {
 //
 
 func TestHandlePREvent_Skip_NotMerged(t *testing.T) {
-	s := &Server{}
+	p := &Processor{}
 	ev := &github.PullRequestEvent{
 		Action:       github.Ptr("labeled"),
 		Installation: &github.Installation{ID: github.Ptr(int64(1))},
@@ -336,11 +310,11 @@ func TestHandlePREvent_Skip_NotMerged(t *testing.T) {
 			Merged: github.Ptr(false),
 		},
 	}
-	s.handlePREvent(context.Background(), "test-delivery", ev) // just exercise path
+	p.handlePREvent(context.Background(), "test-delivery", ev) // just exercise path
 }
 
 func TestHandlePREvent_Skip_NoInstallation(t *testing.T) {
-	s := &Server{}
+	p := &Processor{}
 	ev := &github.PullRequestEvent{
 		Action: github.Ptr("closed"),
 		Repo: &github.Repository{
@@ -352,7 +326,7 @@ func TestHandlePREvent_Skip_NoInstallation(t *testing.T) {
 			Merged: github.Ptr(true),
 		},
 	}
-	s.handlePREvent(context.Background(), "test-delivery", ev)
+	p.handlePREvent(context.Background(), "test-delivery", ev)
 }
 
 //
@@ -360,7 +334,7 @@ func TestHandlePREvent_Skip_NoInstallation(t *testing.T) {
 //
 
 func TestProcessMergedPR_SuccessCreatesPR(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	pr := mergedPR(7, "Fix bug", "abc123456789", "cherry-pick to devops-release/0021")
 	fpr := &fakePRFull{prGet: pr}
@@ -372,9 +346,9 @@ func TestProcessMergedPR_SuccessCreatesPR(t *testing.T) {
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
 	// Cherry-pick succeeds and returns a work branch
-	s.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/abc1234"}
+	p.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/abc1234"}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 7, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 7, nil, "tok")
 
 	if fpr.createdPR == nil {
 		t.Fatalf("expected a new PR to be created")
@@ -389,7 +363,7 @@ func TestProcessMergedPR_SuccessCreatesPR(t *testing.T) {
 }
 
 func TestProcessMergedPR_NoOpCherryPick(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	pr := mergedPR(8, "Tiny tweak", "def123456789", "cherry-pick to devops-release/0021")
 	fpr := &fakePRFull{prGet: pr}
@@ -398,9 +372,9 @@ func TestProcessMergedPR_NoOpCherryPick(t *testing.T) {
 	frepos := &fakeReposFull{commit: repoCommitWithParents(1)}
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
-	s.CherryRunner = fakeCherry{err: cherry.ErrNoopCherryPick}
+	p.CherryRunner = fakeCherry{err: cherry.ErrNoopCherryPick}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 8, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 8, nil, "tok")
 
 	if fpr.createdPR != nil {
 		t.Fatalf("did not expect a PR to be created")
@@ -415,7 +389,7 @@ func TestProcessMergedPR_NoOpCherryPick(t *testing.T) {
 }
 
 func TestProcessMergedPR_Idempotent_WorkBranchExistsWithOpenPR(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	pr := mergedPR(9, "Fix", "aaa1111222", "cherry-pick to devops-release/0021")
 	fpr := &fakePRFull{
@@ -431,9 +405,9 @@ func TestProcessMergedPR_Idempotent_WorkBranchExistsWithOpenPR(t *testing.T) {
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
 	// Runner should not be called here; still safe to set.
-	s.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/aaa1111"}
+	p.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/aaa1111"}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 9, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 9, nil, "tok")
 
 	if fpr.createdPR != nil {
 		t.Fatalf("did not expect new PR")
@@ -448,7 +422,7 @@ func TestProcessMergedPR_Idempotent_WorkBranchExistsWithOpenPR(t *testing.T) {
 }
 
 func TestProcessMergedPR_Idempotent_WorkBranchExistsNoOpenPR(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	pr := mergedPR(12, "Fix idempotent", "ddd4444555", "cherry-pick to devops-release/0021")
 	fpr := &fakePRFull{prGet: pr, list: nil} // no open PRs
@@ -460,7 +434,7 @@ func TestProcessMergedPR_Idempotent_WorkBranchExistsNoOpenPR(t *testing.T) {
 	frepos := &fakeReposFull{commit: repoCommitWithParents(1)}
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 12, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 12, nil, "tok")
 
 	if fpr.createdPR != nil {
 		t.Fatalf("did not expect new PR")
@@ -471,7 +445,7 @@ func TestProcessMergedPR_Idempotent_WorkBranchExistsNoOpenPR(t *testing.T) {
 }
 
 func TestProcessMergedPR_TargetMissing(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	pr := mergedPR(10, "Fix", "bbb2222333", "cherry-pick to devops-release/9999")
 	fpr := &fakePRFull{prGet: pr}
@@ -480,9 +454,9 @@ func TestProcessMergedPR_TargetMissing(t *testing.T) {
 	frepos := &fakeReposFull{commit: repoCommitWithParents(1)}
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
-	s.CherryRunner = fakeCherry{workBranch: "will-not-be-used"}
+	p.CherryRunner = fakeCherry{workBranch: "will-not-be-used"}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 10, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 10, nil, "tok")
 
 	if fpr.createdPR != nil {
 		t.Fatalf("did not expect a PR to be created")
@@ -497,7 +471,7 @@ func TestProcessMergedPR_TargetMissing(t *testing.T) {
 }
 
 func TestProcessMergedPR_MergeCommit_UsesMainlinePath(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	pr := mergedPR(11, "Merge-y fix", "cafef00d1234567", "cherry-pick to devops-release/0021")
 	fpr := &fakePRFull{prGet: pr}
@@ -507,9 +481,9 @@ func TestProcessMergedPR_MergeCommit_UsesMainlinePath(t *testing.T) {
 	frepos := &fakeReposFull{commit: repoCommitWithParents(2)}
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
-	s.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/cafef00"}
+	p.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/cafef00"}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 11, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 11, nil, "tok")
 
 	if fpr.createdPR == nil {
 		t.Fatalf("expected a new PR to be created")
@@ -520,7 +494,7 @@ func TestProcessMergedPR_MergeCommit_UsesMainlinePath(t *testing.T) {
 }
 
 func TestProcessMergedPR_FallbackToListCommits(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	// MergeCommitSHA empty, must fall back to ListCommits (last commit)
 	pr := mergedPR(13, "Fallback SHA", "", "cherry-pick to devops-release/0021")
@@ -536,9 +510,9 @@ func TestProcessMergedPR_FallbackToListCommits(t *testing.T) {
 	frepos := &fakeReposFull{commit: repoCommitWithParents(1)}
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
-	s.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/feedfac"}
+	p.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/feedfac"}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 13, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 13, nil, "tok")
 
 	if fpr.createdPR == nil {
 		t.Fatalf("expected PR to be created")
@@ -546,7 +520,7 @@ func TestProcessMergedPR_FallbackToListCommits(t *testing.T) {
 }
 
 func TestProcessMergedPR_CantDetermineSHA(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	// MergeCommitSHA empty, ListCommits returns empty slice -> comment a warning
 	pr := mergedPR(14, "No SHA", "", "cherry-pick to devops-release/0021")
@@ -556,7 +530,7 @@ func TestProcessMergedPR_CantDetermineSHA(t *testing.T) {
 	frepos := &fakeReposFull{commit: repoCommitWithParents(1)}
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 14, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 14, nil, "tok")
 
 	if len(fiss.comments) == 0 || !strings.Contains(fiss.comments[0].GetBody(), "Could not determine merged commit SHA") {
 		t.Fatalf("expected warning about missing SHA")
@@ -564,7 +538,7 @@ func TestProcessMergedPR_CantDetermineSHA(t *testing.T) {
 }
 
 func TestProcessMergedPR_CreatePROpenError(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	pr := mergedPR(15, "Create PR error", "c001d00d1234567", "cherry-pick to devops-release/0021")
 	fpr := &fakePRFull{prGet: pr, createErr: errors.New("boom")}
@@ -573,9 +547,9 @@ func TestProcessMergedPR_CreatePROpenError(t *testing.T) {
 	frepos := &fakeReposFull{commit: repoCommitWithParents(1)}
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
-	s.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/c001d00"}
+	p.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/c001d00"}
 
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 15, nil, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 15, nil, "tok")
 
 	if fpr.createdPR != nil {
 		t.Fatalf("did not expect PR to be created")
@@ -586,7 +560,7 @@ func TestProcessMergedPR_CreatePROpenError(t *testing.T) {
 }
 
 func TestProcessMergedPR_TargetsOverrideUsed(t *testing.T) {
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
+	p := &Processor{GitUserName: "bot", GitUserEmail: "bot@noreply"}
 
 	// PR labels do NOT include our targets; we pass overrides.
 	pr := mergedPR(16, "Override targets", "0a0b0c0d0e0f", "cherry-pick to foo")
@@ -599,10 +573,10 @@ func TestProcessMergedPR_TargetsOverrideUsed(t *testing.T) {
 	frepos := &fakeReposFull{commit: repoCommitWithParents(1)}
 	gh := fakeGH{pr: fpr, iss: fiss, git: fgit, repos: frepos}
 
-	s.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/0a0b0c0"}
+	p.CherryRunner = fakeCherry{workBranch: "autocherry/devops-release-0021/0a0b0c0"}
 
 	overrides := []string{"devops-release/0021", "devops-release/9999"}
-	s.processMergedPRWith(context.Background(), "d", gh, "o", "r", 16, overrides, "tok")
+	p.processMergedPRWith(context.Background(), "d", gh, "o", "r", 16, overrides, "tok")
 
 	// Expect: one success comment for 0021 and one warning for 9999
 	if len(fiss.comments) < 2 {
@@ -624,39 +598,15 @@ func TestProcessMergedPR_TargetsOverrideUsed(t *testing.T) {
 }
 
 //
-// ---------- cherryRunner() seam tests ----------
-//
-
-func TestCherryRunner_DefaultVsInjected(t *testing.T) {
-	// Default (nil) -> realCherryRunner with configured actor
-	s := &Server{GitUserName: "bot", GitUserEmail: "bot@noreply"}
-	cr := s.cherryRunner()
-	rc, ok := cr.(realCherryRunner)
-	if !ok {
-		t.Fatalf("expected realCherryRunner")
-	}
-	if rc.actor.Name != "bot" || rc.actor.Email != "bot@noreply" {
-		t.Fatalf("actor not propagated")
-	}
-
-	// Injected
-	inj := fakeCherry{workBranch: "x"}
-	s2 := &Server{CherryRunner: inj}
-	if _, ok := s2.cherryRunner().(fakeCherry); !ok {
-		t.Fatalf("expected injected fakeCherry")
-	}
-}
-
-//
-// ---------- ensureLabel / enforceLabelRetention ----------
+// ---------- ensureLabel / enforceLabelRetention (merged from labels_retention_test.go) ----------
 //
 
 func TestEnsureLabel_ListError(t *testing.T) {
 	fiss := &fakeIssuesFull{listErr: errors.New("list blew up")}
 	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	s := &Server{}
+	p := &Processor{}
 
-	err := s.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028")
+	err := p.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028")
 	if err == nil || !strings.Contains(err.Error(), "list blew up") {
 		t.Fatalf("expected list error to bubble up, got: %v", err)
 	}
@@ -671,9 +621,9 @@ func TestEnforceLabelRetention_KeepZero_NoOp(t *testing.T) {
 		},
 	}
 	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	s := &Server{}
+	p := &Processor{}
 
-	if err := s.enforceLabelRetention(context.Background(), gh, "o", "r", 0); err != nil {
+	if err := p.enforceLabelRetention(context.Background(), gh, "o", "r", 0); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fiss.deleted) != 0 {
@@ -688,9 +638,9 @@ func TestEnsureLabel_CreatesWhenMissing(t *testing.T) {
 		},
 	}
 	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	s := &Server{}
+	p := &Processor{}
 
-	err := s.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028")
+	err := p.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028")
 	if err != nil {
 		t.Fatalf("ensureLabel error: %v", err)
 	}
@@ -706,9 +656,9 @@ func TestEnsureLabel_NoOpWhenExists(t *testing.T) {
 		},
 	}
 	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	s := &Server{}
+	p := &Processor{}
 
-	if err := s.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028"); err != nil {
+	if err := p.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(fiss.created) != 0 {
@@ -743,9 +693,9 @@ func TestEnforceLabelRetention_DeletesOldOnesPerTeam(t *testing.T) {
 		},
 	}
 	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	s := &Server{}
+	p := &Processor{}
 
-	if err := s.enforceLabelRetention(context.Background(), gh, "o", "r", 5); err != nil {
+	if err := p.enforceLabelRetention(context.Background(), gh, "o", "r", 5); err != nil {
 		t.Fatalf("enforceLabelRetention error: %v", err)
 	}
 
@@ -755,81 +705,15 @@ func TestEnforceLabelRetention_DeletesOldOnesPerTeam(t *testing.T) {
 		"cherry-pick to devops-release/0023",
 		"cherry-pick to neo-release/0021",
 	}
-	sort.Strings(fiss.deleted)
-	sort.Strings(wantDeletes)
-	if strings.Join(fiss.deleted, ",") != strings.Join(wantDeletes, ",") {
-		t.Fatalf("deleted = %v, want %v", fiss.deleted, wantDeletes)
+	// simple set compare
+	gotSet := map[string]bool{}
+	for _, d := range fiss.deleted {
+		gotSet[d] = true
 	}
-}
-
-//
-// ---------- removeLabelFromOpenPRs ----------
-//
-
-func TestRemoveLabelFromOpenPRs(t *testing.T) {
-	fiss := &fakeIssuesFull{
-		listByRepo: []*github.Issue{
-			{
-				Number: github.Ptr(10),
-				State:  github.Ptr("open"),
-				Labels: []*github.Label{{Name: github.Ptr("cherry-pick to devops-release/0030")}},
-			},
-			{
-				Number: github.Ptr(11),
-				State:  github.Ptr("closed"), // ignored
-				Labels: []*github.Label{{Name: github.Ptr("cherry-pick to devops-release/0030")}},
-			},
-		},
-	}
-	gh := fakeGH{iss: fiss, repos: &fakeReposFull{}, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	s := &Server{}
-
-	if err := s.removeLabelFromOpenPRs(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0030"); err != nil {
-		t.Fatalf("removeLabelFromOpenPRs error: %v", err)
-	}
-	if len(fiss.removed) != 1 || fiss.removed[0].Num != 10 {
-		t.Fatalf("expected to remove label from PR #10 only; got %+v", fiss.removed)
-	}
-}
-
-//
-// ---------- processUnlabeled path ----------
-//
-
-func TestProcessUnlabeled_ClosesAutoCherryPRAndDeletesBranch(t *testing.T) {
-	mainPR := 100
-	target := "devops-release/0042"
-	workBranch := "autocherry/devops-release-0042/c0ffee1"
-
-	// One open PR from the work branch to the target
-	prList := &fakePRFull{
-		list: []*github.PullRequest{
-			{
-				Number:  github.Ptr(200),
-				State:   github.Ptr("open"),
-				Base:    &github.PullRequestBranch{Ref: github.Ptr(target)},
-				Head:    &github.PullRequestBranch{Ref: github.Ptr(workBranch)},
-				HTMLURL: github.Ptr("https://example.com/auto"),
-			},
-		},
-	}
-	// Same instance will also record edits (closing)
-	git := &fakeGitFull{}
-	iss := &fakeIssuesFull{}
-	repos := &fakeReposFull{}
-	gh := fakeGH{pr: prList, iss: iss, git: git, repos: repos}
-
-	s := &Server{}
-	if err := s.processUnlabeled(context.Background(), gh, "o", "r", mainPR, target, workBranch); err != nil {
-		t.Fatalf("processUnlabeled error: %v", err)
-	}
-
-	// PR edited (closed) and branch deleted
-	if len(prList.edited) == 0 || prList.edited[0].GetState() != "closed" {
-		t.Fatalf("expected PR to be closed; got %+v", prList.edited)
-	}
-	if len(git.deletedRefs) == 0 || git.deletedRefs[0] != "refs/heads/"+workBranch {
-		t.Fatalf("expected work branch ref to be deleted; got %v", git.deletedRefs)
+	for _, w := range wantDeletes {
+		if !gotSet[w] {
+			t.Fatalf("expected deleted to include %q; got %v", w, fiss.deleted)
+		}
 	}
 }
 

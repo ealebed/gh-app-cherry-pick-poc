@@ -1,17 +1,24 @@
 package main
 
 import (
+	"context"
 	"log"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 
+	awscfg "github.com/aws/aws-sdk-go-v2/config"
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+
 	"github.com/ealebed/gh-app-cherry-pick-poc/internal/config"
-	"github.com/ealebed/gh-app-cherry-pick-poc/internal/webhook"
+	"github.com/ealebed/gh-app-cherry-pick-poc/internal/ingest/sqs"
+	"github.com/ealebed/gh-app-cherry-pick-poc/internal/processor"
 )
 
 func main() {
@@ -35,7 +42,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	srv := &webhook.Server{
+	// Build the GitHub processor (renamed from webhook.Server).
+	p := &processor.Processor{
 		AppID:         cfg.AppID,
 		PrivateKeyPEM: cfg.PrivateKeyPEM,
 		WebhookSecret: cfg.WebhookSecret,
@@ -43,10 +51,70 @@ func main() {
 		GitUserEmail:  cfg.GitUserEmail,
 	}
 
-	r := mux.NewRouter()
-	r.Handle("/webhook", srv).Methods("POST")
-	r.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }).Methods("GET")
+	// AWS SDK v2 config + SQS client.
+	awsCfg, err := awscfg.LoadDefaultConfig(context.Background(),
+		awscfg.WithRegion(cfg.AWSRegion),
+	)
+	if err != nil {
+		log.Fatalf("load AWS config: %v", err)
+	}
+	sqsClient := awssqs.NewFromConfig(awsCfg)
 
-	slog.Info("server.start", "addr", cfg.ListenPort)
-	log.Fatal(http.ListenAndServe(cfg.ListenPort, r))
+	// SQS worker wiring.
+	worker := &sqs.Worker{
+		Client:            sqsClient,
+		QueueURL:          cfg.SQSQueueURL,
+		MaxMessages:       cfg.SQSMaxMessages,
+		WaitTimeSeconds:   cfg.SQSWaitTimeSeconds,
+		VisibilityTimeout: cfg.SQSVisibilityTimeout,
+		DeleteOn4xx:       cfg.SQSDeleteOn4xx,
+		// SQSExtendOnProcessing is reserved for future use
+		Processor: p,
+	}
+
+	// Health endpoint.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	srv := &http.Server{
+		Addr:              cfg.ListenPort,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	// Run worker until we get a shutdown signal.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("sqs.worker.exit", "err", err)
+			// If worker exits unexpectedly, stop the HTTP server too.
+			_ = srv.Shutdown(context.Background())
+		}
+	}()
+
+	// Handle SIGINT/SIGTERM for graceful shutdown.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	// Run HTTP (healthz) server.
+	go func() {
+		slog.Info("server.start", "addr", cfg.ListenPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("server.error", "err", err)
+			stop <- syscall.SIGTERM
+		}
+	}()
+
+	<-stop
+	slog.Info("shutdown.begin")
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("server.shutdown.error", "err", err)
+	}
+	slog.Info("shutdown.complete")
 }

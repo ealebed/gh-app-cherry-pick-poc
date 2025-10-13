@@ -1,4 +1,4 @@
-package webhook
+package processor
 
 import (
 	"context"
@@ -18,13 +18,10 @@ type PullRequestsAPI interface {
 }
 
 type IssuesAPI interface {
-	// comments
 	CreateComment(ctx context.Context, owner, repo string, number int, comment *github.IssueComment) (*github.IssueComment, *github.Response, error)
-	// listing issues (used for removing labels from open PRs)
 	ListByRepo(ctx context.Context, owner, repo string, opt *github.IssueListByRepoOptions) ([]*github.Issue, *github.Response, error)
 	RemoveLabelForIssue(ctx context.Context, owner, repo string, number int, label string) (*github.Response, error)
 
-	// LABELS live under Issues service in go-github
 	ListLabels(ctx context.Context, owner, repo string, opts *github.ListOptions) ([]*github.Label, *github.Response, error)
 	CreateLabel(ctx context.Context, owner, repo string, label *github.Label) (*github.Label, *github.Response, error)
 	DeleteLabel(ctx context.Context, owner, repo, name string) (*github.Response, error)
@@ -54,7 +51,7 @@ func (r realGH) Issues() IssuesAPI      { return r.c.Issues }
 func (r realGH) Git() GitAPI            { return r.c.Git }
 func (r realGH) Repos() RepositoriesAPI { return r.c.Repositories }
 
-// Optional compile-time assertions to ensure the real services satisfy our interfaces.
+// Optional compile-time assertions
 var (
 	_ PullRequestsAPI = (*github.PullRequestsService)(nil)
 	_ IssuesAPI       = (*github.IssuesService)(nil)
