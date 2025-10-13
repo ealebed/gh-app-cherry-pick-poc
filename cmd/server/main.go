@@ -42,7 +42,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Build the GitHub processor (renamed from webhook.Server).
+	// Build the GitHub processor.
 	p := &processor.Processor{
 		AppID:         cfg.AppID,
 		PrivateKeyPEM: cfg.PrivateKeyPEM,
@@ -60,7 +60,7 @@ func main() {
 	}
 	sqsClient := awssqs.NewFromConfig(awsCfg)
 
-	// SQS worker wiring.
+	// SQS worker wiring — note: we pass *processor.Processor which implements the Worker’s Handler interface.
 	worker := &sqs.Worker{
 		Client:            sqsClient,
 		QueueURL:          cfg.SQSQueueURL,
@@ -68,8 +68,7 @@ func main() {
 		WaitTimeSeconds:   cfg.SQSWaitTimeSeconds,
 		VisibilityTimeout: cfg.SQSVisibilityTimeout,
 		DeleteOn4xx:       cfg.SQSDeleteOn4xx,
-		// SQSExtendOnProcessing is reserved for future use
-		Processor: p,
+		Processor:         p,
 	}
 
 	// Health endpoint.
@@ -89,7 +88,6 @@ func main() {
 	go func() {
 		if err := worker.Run(ctx); err != nil && ctx.Err() == nil {
 			slog.Error("sqs.worker.exit", "err", err)
-			// If worker exits unexpectedly, stop the HTTP server too.
 			_ = srv.Shutdown(context.Background())
 		}
 	}()

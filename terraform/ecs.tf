@@ -143,7 +143,5 @@ resource "aws_ecs_service" "worker" {
     assign_public_ip = true
   }
 
-  lifecycle {
-    ignore_changes = [task_definition] # allow rolling updates by new revision
-  }
+  force_new_deployment = true
 }

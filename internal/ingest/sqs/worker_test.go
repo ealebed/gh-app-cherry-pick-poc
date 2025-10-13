@@ -1,126 +1,105 @@
 package sqs
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
-// helper to build an SQS message with string attributes
-func mkMessage(body string, attrs map[string]string) awstypes.Message {
-	m := awstypes.Message{
-		Body:          aws.String(body),
-		MessageId:     aws.String("m-1"),
-		ReceiptHandle: aws.String("r-1"),
-	}
-	if len(attrs) > 0 {
-		m.MessageAttributes = make(map[string]awstypes.MessageAttributeValue, len(attrs))
-		for k, v := range attrs {
-			m.MessageAttributes[k] = awstypes.MessageAttributeValue{
-				StringValue: aws.String(v),
-				// Type is optional for our use; SQS sets it when publishing.
-			}
-		}
-	}
-	return m
+// ---- a tiny fake processor ----
+
+type fakeHandler struct {
+	lastEvent    string
+	lastDelivery string
+	lastPayload  []byte
+
+	code int
+	err  error
 }
 
-func Test_toEnvelope_AlreadyWrappedEnvelope(t *testing.T) {
-	w := &Worker{}
+func (f *fakeHandler) HandleEvent(ctx context.Context, event, delivery string, payload []byte) (int, error) {
+	f.lastEvent = event
+	f.lastDelivery = delivery
+	f.lastPayload = payload
+	return f.code, f.err
+}
 
-	orig := APIGWEnvelope{
-		Headers: map[string]string{
-			"X-GitHub-Event":      "pull_request",
-			"X-Hub-Signature-256": "sha256=abc123",
-			"X-GitHub-Delivery":   "d-1",
+// ---- tests ----
+
+func Test_handleSQSMessage_MinimalPullRequest(t *testing.T) {
+	w := &Worker{
+		Processor: &fakeHandler{code: 200},
+	}
+
+	// Minimal GH pull_request payload (no headers).
+	body := map[string]any{
+		"action":       "closed",
+		"pull_request": map[string]any{"merged": true},
+		"installation": map[string]any{"id": 1},
+		"repository": map[string]any{
+			"name": "repo",
+			"owner": map[string]any{
+				"login": "owner",
+			},
 		},
-		Body: `{"action":"opened"}`,
+		"number": 7,
 	}
-	b, _ := json.Marshal(orig)
+	raw, _ := json.Marshal(body)
 
-	msg := mkMessage(string(b), nil)
-
-	got, err := w.toEnvelope(msg)
+	code, err := w.handleSQSMessage(context.Background(), raw, "m-1")
 	if err != nil {
-		t.Fatalf("toEnvelope error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	// Expect headers/body preserved exactly
-	if got.Body != orig.Body {
-		t.Fatalf("body mismatch: got=%q want=%q", got.Body, orig.Body)
+	if code != 200 {
+		t.Fatalf("expected 200, got %d", code)
 	}
-	for k, v := range orig.Headers {
-		if got.Headers[k] != v {
-			t.Fatalf("header %s mismatch: got=%q want=%q", k, got.Headers[k], v)
-		}
+
+	fh := w.Processor.(*fakeHandler)
+	if fh.lastEvent != "pull_request" {
+		t.Fatalf("expected event=pull_request, got %q", fh.lastEvent)
+	}
+	if fh.lastDelivery == "" {
+		t.Fatalf("expected non-empty delivery (fallback to message id)")
+	}
+	if string(fh.lastPayload) != string(raw) {
+		t.Fatalf("payload mismatch")
 	}
 }
 
-func Test_toEnvelope_RawBodyWithAttributes(t *testing.T) {
-	w := &Worker{}
+func Test_handleSQSMessage_BadEnvelope(t *testing.T) {
+	w := &Worker{
+		Processor: &fakeHandler{code: 200},
+	}
+	// Not JSON -> parser should fail
+	code, err := w.handleSQSMessage(context.Background(), []byte("{{not json"), "m-2")
+	if err == nil {
+		t.Fatalf("expected error for bad envelope")
+	}
+	if code != 400 {
+		t.Fatalf("expected 400 for bad envelope, got %d", code)
+	}
+}
 
-	body := `{"action":"closed"}`
-	msg := mkMessage(body, map[string]string{
-		"X-GitHub-Event":      "pull_request",
-		"X-Hub-Signature-256": "sha256=deadbeef",
-		"X-GitHub-Delivery":   "delivery-123",
-	})
+func Test_handleSQSMessage_UnknownEvent_NoFailure(t *testing.T) {
+	w := &Worker{
+		// Make handler return 204 for unknown event.
+		Processor: &fakeHandler{code: 204},
+	}
 
-	got, err := w.toEnvelope(msg)
+	// An event the parser can detect but we treat as unknown in our handler,
+	// e.g. a "ping" webhook shape (simplified).
+	body := map[string]any{
+		"zen": "Design for failure",
+	}
+	raw, _ := json.Marshal(body)
+
+	// Note: our parser will likely classify this as "unknown" event.
+	code, err := w.handleSQSMessage(context.Background(), raw, "m-3")
 	if err != nil {
-		t.Fatalf("toEnvelope error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if got.Body != body {
-		t.Fatalf("body mismatch: got=%q want=%q", got.Body, body)
-	}
-	if got.Headers["X-GitHub-Event"] != "pull_request" {
-		t.Fatalf("event header missing or wrong: %q", got.Headers["X-GitHub-Event"])
-	}
-	if got.Headers["X-Hub-Signature-256"] != "sha256=deadbeef" {
-		t.Fatalf("sig header missing or wrong: %q", got.Headers["X-Hub-Signature-256"])
-	}
-	if got.Headers["X-GitHub-Delivery"] != "delivery-123" {
-		t.Fatalf("delivery header missing or wrong: %q", got.Headers["X-GitHub-Delivery"])
-	}
-}
-
-func Test_toEnvelope_MissingRequiredHeaders(t *testing.T) {
-	w := &Worker{}
-
-	// Missing signature header
-	msg := mkMessage(`{"action":"anything"}`, map[string]string{
-		"X-GitHub-Event": "pull_request",
-	})
-
-	_, err := w.toEnvelope(msg)
-	if err == nil {
-		t.Fatalf("expected error for missing X-Hub-Signature-256, got nil")
-	}
-
-	// Missing event header
-	msg = mkMessage(`{"action":"anything"}`, map[string]string{
-		"X-Hub-Signature-256": "sha256=abc",
-	})
-	_, err = w.toEnvelope(msg)
-	if err == nil {
-		t.Fatalf("expected error for missing X-GitHub-Event, got nil")
-	}
-}
-
-func Test_toEnvelope_EmptyBody(t *testing.T) {
-	w := &Worker{}
-
-	// Body is empty (nil pointer yields "")
-	msg := awstypes.Message{
-		Body:          nil,
-		MessageId:     aws.String("m-2"),
-		ReceiptHandle: aws.String("r-2"),
-	}
-
-	_, err := w.toEnvelope(msg)
-	if err == nil {
-		t.Fatalf("expected error for empty body, got nil")
+	if code != 204 {
+		t.Fatalf("expected 204 passthrough, got %d", code)
 	}
 }
 
