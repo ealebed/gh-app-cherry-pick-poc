@@ -2,38 +2,30 @@ package sqs
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
 	aws "github.com/aws/aws-sdk-go-v2/aws"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
-	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+
+	qparser "github.com/ealebed/gh-app-cherry-pick-poc/internal/queue"
 )
 
-// APIGWEnvelope is the shape we pass to the processor.
-// Body is plain string (raw JSON payload from GitHub), headers are flattened.
-type APIGWEnvelope struct {
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"`
-}
-
-// Handler is the minimal interface the processor must satisfy.
+// Handler is implemented by the processor layer.
+// Return an HTTP-like status and an error (nil on success).
 type Handler interface {
-	HandleFromEnvelope(ctx context.Context, env APIGWEnvelope) (int, error)
+	HandleEvent(ctx context.Context, event, delivery string, payload []byte) (int, error)
 }
 
-// Worker polls SQS, converts messages to APIGWEnvelope, and dispatches to a Handler.
+// Worker polls SQS, parses message envelopes, and dispatches to a Handler.
 type Worker struct {
-	Client             *awssqs.Client
-	QueueURL           string
-	MaxMessages        int32 // 1..10
-	WaitTimeSeconds    int32 // 0..20
-	VisibilityTimeout  int32 // seconds
-	DeleteOn4xx        bool
-	ExtendOnProcessing bool // (reserved for future use)
+	Client            *awssqs.Client
+	QueueURL          string
+	MaxMessages       int32 // 1..10
+	WaitTimeSeconds   int32 // 0..20
+	VisibilityTimeout int32 // seconds
+	DeleteOn4xx       bool
 
 	Processor Handler
 }
@@ -59,18 +51,15 @@ func (w *Worker) Run(ctx context.Context) error {
 		default:
 		}
 
-		// Receive
 		out, err := w.Client.ReceiveMessage(ctx, &awssqs.ReceiveMessageInput{
-			QueueUrl:              aws.String(w.QueueURL),
-			MaxNumberOfMessages:   w.vOrDefault(w.MaxMessages, 10),
-			WaitTimeSeconds:       w.vOrDefault(w.WaitTimeSeconds, 10),
-			VisibilityTimeout:     w.vOrDefault(w.VisibilityTimeout, 120),
-			MessageAttributeNames: []string{"All"},
-			// We don't need AttributeNames for queue or system attributes here.
+			QueueUrl:            aws.String(w.QueueURL),
+			MaxNumberOfMessages: w.vOrDefault(w.MaxMessages, 10),
+			WaitTimeSeconds:     w.vOrDefault(w.WaitTimeSeconds, 10),
+			VisibilityTimeout:   w.vOrDefault(w.VisibilityTimeout, 120),
 		})
 		if err != nil {
 			slog.Error("sqs.receive.error", "err", err)
-			// small backoff to avoid hot loop on persistent errors
+			// small backoff to avoid a hot loop on persistent errors
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -83,25 +72,16 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		for _, m := range out.Messages {
-			// Defensive: every message should have ReceiptHandle
 			if m.ReceiptHandle == nil {
 				slog.Warn("sqs.message.missing_receipt_handle", "messageID", aws.ToString(m.MessageId))
 				continue
 			}
+			body := []byte(aws.ToString(m.Body))
+			msgID := aws.ToString(m.MessageId)
 
-			// Build envelope.
-			env, envErr := w.toEnvelope(m)
-			if envErr != nil {
-				slog.Error("sqs.message.bad_envelope", "err", envErr, "messageID", aws.ToString(m.MessageId))
-				// If we cannot parse, delete the poison message to avoid blocking.
-				_ = w.deleteMessage(ctx, aws.ToString(m.ReceiptHandle))
-				continue
-			}
+			code, procErr := w.handleSQSMessage(ctx, body, msgID)
 
-			// Dispatch.
-			code, procErr := w.Processor.HandleFromEnvelope(ctx, env)
-
-			// Decide deletion based on status code and policy.
+			// Decide deletion based on status and policy.
 			shouldDelete := false
 			switch {
 			case code >= 200 && code < 300:
@@ -109,7 +89,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			case code >= 400 && code < 500:
 				shouldDelete = w.DeleteOn4xx
 			default:
-				// 5xx or unknown -> keep for retry (visibility will expire)
+				// 5xx/unknown -> keep for retry (visibility will expire)
 			}
 
 			if procErr != nil {
@@ -117,61 +97,59 @@ func (w *Worker) Run(ctx context.Context) error {
 					"status", code,
 					"err", procErr,
 					"delete", shouldDelete,
-					"messageID", aws.ToString(m.MessageId),
+					"messageID", msgID,
 				)
 			} else {
 				slog.Info("sqs.message.processed",
 					"status", code,
 					"delete", shouldDelete,
-					"messageID", aws.ToString(m.MessageId),
+					"messageID", msgID,
 				)
 			}
 
 			if shouldDelete {
 				if derr := w.deleteMessage(ctx, aws.ToString(m.ReceiptHandle)); derr != nil {
-					slog.Error("sqs.message.delete_error", "err", derr, "messageID", aws.ToString(m.MessageId))
+					slog.Error("sqs.message.delete_error", "err", derr, "messageID", msgID)
 				}
 			}
 		}
 	}
 }
 
-func (w *Worker) toEnvelope(m types.Message) (APIGWEnvelope, error) {
-	// We support two forms:
-	// 1) Body itself is the APIGWEnvelope JSON: {"headers":{...},"body":"..."}
-	// 2) Body is the raw GitHub payload, and headers are provided in MessageAttributes.
-	//    MessageAttributes["X-GitHub-Event"], ["X-GitHub-Delivery"], ["X-Hub-Signature-256"], etc.
-	var env APIGWEnvelope
-
-	// Try to unmarshal directly into APIGWEnvelope.
-	if body := aws.ToString(m.Body); body != "" {
-		if json.Unmarshal([]byte(body), &env) == nil && len(env.Headers) > 0 {
-			// Looks like an envelope already; return it.
-			return env, nil
+// handleSQSMessage parses the envelope and dispatches to the Processor.
+// It does not touch SQS; the caller controls deletion based on the return code.
+func (w *Worker) handleSQSMessage(ctx context.Context, msgBody []byte, msgID string) (int, error) {
+	event, delivery, payload, err := qparser.ParseSQSBody(msgBody)
+	if err != nil {
+		// Treat "unknown event" as a benign no-op (204, no error).
+		if errors.Is(err, qparser.ErrUnknownEvent) {
+			slog.Info("sqs.message.unknown_event", "messageID", msgID)
+			return 204, nil
 		}
-		// Otherwise, treat Body as raw GH payload, wrap with headers from attributes.
-		env.Body = body
-	} else {
-		return APIGWEnvelope{}, errors.New("empty SQS message body")
+		// All other parse/shape errors are bad envelopes (400) so deletion
+		// policy can drop them to avoid poison loops.
+		slog.Error("sqs.message.bad_envelope", "err", err, "messageID", msgID)
+		return 400, err
+	}
+	if delivery == "" {
+		delivery = msgID
+	}
+	if len(payload) == 0 {
+		// Nothing useful to process.
+		return 204, nil
 	}
 
-	hdrs := map[string]string{}
-	for k, v := range m.MessageAttributes {
-		// Only StringValue is expected for our GH/ApiGW headers.
-		if v.StringValue != nil {
-			hdrs[k] = aws.ToString(v.StringValue)
+	// Dispatch to the processor.
+	code, perr := w.Processor.HandleEvent(ctx, event, delivery, payload)
+	if code == 0 {
+		// Defensive default: success when processor forgot to set code.
+		if perr == nil {
+			code = 200
+		} else {
+			code = 500
 		}
 	}
-	env.Headers = hdrs
-
-	// Provide a bit of validation: we expect at least Event and Signature.
-	if _, ok := env.Headers["X-GitHub-Event"]; !ok {
-		return APIGWEnvelope{}, fmt.Errorf("missing required header %q", "X-GitHub-Event")
-	}
-	if _, ok := env.Headers["X-Hub-Signature-256"]; !ok {
-		return APIGWEnvelope{}, fmt.Errorf("missing required header %q", "X-Hub-Signature-256")
-	}
-	return env, nil
+	return code, perr
 }
 
 func (w *Worker) deleteMessage(ctx context.Context, receipt string) error {

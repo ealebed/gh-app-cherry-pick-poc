@@ -17,5 +17,5 @@ variable "common_tags" {
 variable "worker_image" {
   description = "Container image for the worker (e.g. public.ecr.aws/xyz/ghapp:latest)"
   type        = string
-  default     = "docker.io/ealebed/cherrypicker:2025.10.10-11.50"
+  default     = "docker.io/ealebed/cherrypicker:2025.10.13-08.45"
 }

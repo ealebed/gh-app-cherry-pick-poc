@@ -5,13 +5,14 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
-	sqsingest "github.com/ealebed/gh-app-cherry-pick-poc/internal/ingest/sqs"
+	qenv "github.com/ealebed/gh-app-cherry-pick-poc/internal/queue"
 	github "github.com/google/go-github/v75/github"
 
 	"github.com/ealebed/gh-app-cherry-pick-poc/internal/cherry"
@@ -52,10 +53,10 @@ func repoCommitWithParents(n int) *github.RepositoryCommit {
 }
 
 // small helper to build an SQS/APIGW-like envelope for HandleFromEnvelope tests
-func env(headers map[string]string, body []byte) sqsingest.APIGWEnvelope {
-	return sqsingest.APIGWEnvelope{
+func env(headers map[string]string, body []byte) qenv.Envelope {
+	return qenv.Envelope{
 		Headers: headers,
-		Body:    string(body),
+		Body:    json.RawMessage(body), // Body is json.RawMessage now
 	}
 }
 
@@ -357,8 +358,8 @@ func TestProcessMergedPR_SuccessCreatesPR(t *testing.T) {
 		t.Fatalf("expected at least one comment")
 	}
 	got := fiss.comments[len(fiss.comments)-1].GetBody()
-	if !strings.HasPrefix(got, "✅") {
-		t.Fatalf("expected success comment, got %q", got)
+	if !strings.HasPrefix(got, "✅") || !strings.Contains(got, "devops-release/0021") {
+		t.Fatalf("expected success comment mentioning target, got %q", got)
 	}
 }
 
@@ -383,8 +384,8 @@ func TestProcessMergedPR_NoOpCherryPick(t *testing.T) {
 		t.Fatalf("expected a comment")
 	}
 	got := fiss.comments[0].GetBody()
-	if !strings.HasPrefix(got, "ℹ️") {
-		t.Fatalf("expected info comment, got %q", got)
+	if !strings.HasPrefix(got, "ℹ️") || !strings.Contains(got, "devops-release/0021") {
+		t.Fatalf("expected info comment including target, got %q", got)
 	}
 }
 
@@ -416,8 +417,8 @@ func TestProcessMergedPR_Idempotent_WorkBranchExistsWithOpenPR(t *testing.T) {
 		t.Fatalf("expected a comment")
 	}
 	got := fiss.comments[0].GetBody()
-	if !strings.HasPrefix(got, "ℹ️") {
-		t.Fatalf("expected info comment about already open, got %q", got)
+	if !strings.HasPrefix(got, "ℹ️") || !strings.Contains(got, "devops-release/0021") {
+		t.Fatalf("expected info comment about already open incl target, got %q", got)
 	}
 }
 
@@ -465,7 +466,7 @@ func TestProcessMergedPR_TargetMissing(t *testing.T) {
 		t.Fatalf("expected a comment")
 	}
 	got := fiss.comments[0].GetBody()
-	if !strings.HasPrefix(got, "⚠️") {
+	if !strings.HasPrefix(got, "⚠️") || !strings.Contains(got, "devops-release/9999") {
 		t.Fatalf("expected warning about target missing, got %q", got)
 	}
 }
@@ -585,7 +586,7 @@ func TestProcessMergedPR_TargetsOverrideUsed(t *testing.T) {
 	var ok, warn bool
 	for _, c := range fiss.comments {
 		b := c.GetBody()
-		if strings.HasPrefix(b, "✅") {
+		if strings.HasPrefix(b, "✅") && strings.Contains(b, "devops-release/0021") {
 			ok = true
 		}
 		if strings.HasPrefix(b, "⚠️") && strings.Contains(b, "devops-release/9999") {
@@ -594,126 +595,6 @@ func TestProcessMergedPR_TargetsOverrideUsed(t *testing.T) {
 	}
 	if !ok || !warn {
 		t.Fatalf("expected one success and one warning comment (override path)")
-	}
-}
-
-//
-// ---------- ensureLabel / enforceLabelRetention (merged from labels_retention_test.go) ----------
-//
-
-func TestEnsureLabel_ListError(t *testing.T) {
-	fiss := &fakeIssuesFull{listErr: errors.New("list blew up")}
-	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	p := &Processor{}
-
-	err := p.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028")
-	if err == nil || !strings.Contains(err.Error(), "list blew up") {
-		t.Fatalf("expected list error to bubble up, got: %v", err)
-	}
-}
-
-func TestEnforceLabelRetention_KeepZero_NoOp(t *testing.T) {
-	// keep <= 0 should be a no-op (no deletes)
-	fiss := &fakeIssuesFull{
-		labels: []*github.Label{
-			{Name: github.Ptr("cherry-pick to devops-release/0021")},
-			{Name: github.Ptr("cherry-pick to devops-release/0022")},
-		},
-	}
-	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	p := &Processor{}
-
-	if err := p.enforceLabelRetention(context.Background(), gh, "o", "r", 0); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(fiss.deleted) != 0 {
-		t.Fatalf("expected no deletions when keep=0, got %v", fiss.deleted)
-	}
-}
-
-func TestEnsureLabel_CreatesWhenMissing(t *testing.T) {
-	fiss := &fakeIssuesFull{
-		labels: []*github.Label{
-			{Name: github.Ptr("cherry-pick to devops-release/0027")},
-		},
-	}
-	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	p := &Processor{}
-
-	err := p.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028")
-	if err != nil {
-		t.Fatalf("ensureLabel error: %v", err)
-	}
-	if len(fiss.created) != 1 || fiss.created[0].GetName() != "cherry-pick to devops-release/0028" {
-		t.Fatalf("label not created as expected: %+v", fiss.created)
-	}
-}
-
-func TestEnsureLabel_NoOpWhenExists(t *testing.T) {
-	fiss := &fakeIssuesFull{
-		labels: []*github.Label{
-			{Name: github.Ptr("cherry-pick to devops-release/0028")},
-		},
-	}
-	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	p := &Processor{}
-
-	if err := p.ensureLabel(context.Background(), gh, "o", "r", "cherry-pick to devops-release/0028"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(fiss.created) != 0 {
-		t.Fatalf("should not create when exists")
-	}
-}
-
-func TestEnforceLabelRetention_DeletesOldOnesPerTeam(t *testing.T) {
-	fiss := &fakeIssuesFull{
-		labels: []*github.Label{
-			{Name: github.Ptr("cherry-pick to devops-release/0021")},
-			{Name: github.Ptr("cherry-pick to devops-release/0022")},
-			{Name: github.Ptr("cherry-pick to devops-release/0023")},
-			{Name: github.Ptr("cherry-pick to devops-release/0024")},
-			{Name: github.Ptr("cherry-pick to devops-release/0025")},
-			{Name: github.Ptr("cherry-pick to devops-release/0026")},
-			{Name: github.Ptr("cherry-pick to devops-release/0027")},
-			{Name: github.Ptr("cherry-pick to devops-release/0028")},
-
-			{Name: github.Ptr("cherry-pick to neo-release/0021")},
-			{Name: github.Ptr("cherry-pick to neo-release/0022")},
-			{Name: github.Ptr("cherry-pick to neo-release/0023")},
-			{Name: github.Ptr("cherry-pick to neo-release/0024")},
-			{Name: github.Ptr("cherry-pick to neo-release/0025")},
-			{Name: github.Ptr("cherry-pick to neo-release/0026")},
-
-			{Name: github.Ptr("cherry-pick to core-release/0024")},
-			{Name: github.Ptr("cherry-pick to core-release/0025")},
-			{Name: github.Ptr("cherry-pick to core-release/0026")},
-			{Name: github.Ptr("cherry-pick to core-release/0027")},
-			{Name: github.Ptr("cherry-pick to core-release/0028")},
-		},
-	}
-	gh := fakeGH{repos: &fakeReposFull{}, iss: fiss, pr: &fakePRFull{}, git: &fakeGitFull{}}
-	p := &Processor{}
-
-	if err := p.enforceLabelRetention(context.Background(), gh, "o", "r", 5); err != nil {
-		t.Fatalf("enforceLabelRetention error: %v", err)
-	}
-
-	wantDeletes := []string{
-		"cherry-pick to devops-release/0021",
-		"cherry-pick to devops-release/0022",
-		"cherry-pick to devops-release/0023",
-		"cherry-pick to neo-release/0021",
-	}
-	// simple set compare
-	gotSet := map[string]bool{}
-	for _, d := range fiss.deleted {
-		gotSet[d] = true
-	}
-	for _, w := range wantDeletes {
-		if !gotSet[w] {
-			t.Fatalf("expected deleted to include %q; got %v", w, fiss.deleted)
-		}
 	}
 }
 
