@@ -111,7 +111,8 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 		return http.StatusAccepted, nil
 
 	case "label":
-		// Repo-level label delete: remove that label from open PRs.
+		// Repo-level label delete: remove that label from open PRs
+		// and ALSO clean up autocherry artifacts for merged PRs that had it.
 		var e github.LabelEvent
 		if err := json.Unmarshal(body, &e); err != nil {
 			slog.Error("webhook.bad_payload", "delivery", deliveryID, "err", err)
@@ -140,10 +141,19 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 				return
 			}
 			gh := realGH{c: clients.REST}
+
+			// 1) Detach from OPEN PRs (existing behavior).
 			if err := p.removeLabelFromOpenPRs(ctx2, gh, owner, name, labelName); err != nil {
 				slog.Error("labels.remove_from_open_prs_error", "delivery", deliveryID, "err", err, "label", labelName)
 			} else {
 				slog.Info("labels.removed_from_open_prs", "delivery", deliveryID, "label", labelName)
+			}
+
+			// 2) NEW: Cleanup for merged PRs that used the deleted label.
+			if err := p.cleanupForDeletedRepoLabel(ctx2, gh, owner, name, labelName); err != nil {
+				slog.Error("labels.cleanup_deleted_label_error", "delivery", deliveryID, "label", labelName, "err", err)
+			} else {
+				slog.Info("labels.cleanup_deleted_label_done", "delivery", deliveryID, "label", labelName)
 			}
 		}()
 		return http.StatusAccepted, nil
@@ -541,6 +551,84 @@ func (p *Processor) removeLabelFromOpenPRs(ctx context.Context, gh GH, owner, re
 			continue
 		}
 		_, _ = gh.Issues().RemoveLabelForIssue(ctx, owner, repo, is.GetNumber(), label)
+	}
+	return nil
+}
+
+// cleanupForDeletedRepoLabel finds PRs (state=all) that had the deleted label.
+// For any merged PR, it determines the merge SHA, derives the work branch,
+// and calls processUnlabeled to close autocherry PRs and delete the work branch.
+func (p *Processor) cleanupForDeletedRepoLabel(ctx context.Context, gh GH, owner, repo, labelName string) error {
+	const prefix = "cherry-pick to "
+	if !strings.HasPrefix(labelName, prefix) {
+		return nil
+	}
+	target := strings.TrimSpace(strings.TrimPrefix(labelName, prefix))
+	if target == "" {
+		return nil
+	}
+
+	issues, _, err := gh.Issues().ListByRepo(ctx, owner, repo, &github.IssueListByRepoOptions{
+		State:       "all",
+		Labels:      []string{labelName},
+		ListOptions: github.ListOptions{PerPage: 100},
+	})
+	if err != nil {
+		return fmt.Errorf("list issues by label %q: %w", labelName, err)
+	}
+
+	for _, is := range issues {
+		if is == nil || is.Number == nil {
+			continue
+		}
+		// Only PRs have PullRequestLinks set.
+		if is.PullRequestLinks == nil {
+			continue
+		}
+		prNum := is.GetNumber()
+
+		// Load the PR to check merged status and get title, etc.
+		pr, _, err := gh.PR().Get(ctx, owner, repo, prNum)
+		if err != nil {
+			slog.Warn("labels.cleanup.get_pr_error", "pr", prNum, "err", err)
+			continue
+		}
+		if !pr.GetMerged() {
+			// Only do cleanup for merged PRs (matches our unlabeled-after-merge semantics)
+			continue
+		}
+
+		// Determine merge SHA (same logic as processMergedPRWith)
+		mergeSHA := pr.GetMergeCommitSHA()
+		if mergeSHA == "" {
+			commits, _, lerr := gh.PR().ListCommits(ctx, owner, repo, prNum, &github.ListOptions{PerPage: 250})
+			if lerr != nil || len(commits) == 0 {
+				slog.Warn("labels.cleanup.no_merge_sha", "pr", prNum, "err", lerr)
+				continue
+			}
+			mergeSHA = commits[len(commits)-1].GetSHA()
+		}
+		if mergeSHA == "" {
+			continue
+		}
+		short := mergeSHA
+		if len(short) > 7 {
+			short = mergeSHA[:7]
+		}
+
+		safeTarget := strings.ReplaceAll(target, "/", "-")
+		workBranch := fmt.Sprintf("autocherry/%s/%s", safeTarget, short)
+
+		// Close any open autocherry PR and delete the work branch.
+		if err := p.processUnlabeled(ctx, gh, owner, repo, prNum, target, workBranch); err != nil {
+			slog.Error("labels.cleanup.process_unlabeled_error", "pr", prNum, "target", target, "err", err)
+			continue
+		}
+
+		// Optional info comment on the original (merged) PR.
+		_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
+			Body: github.Ptr(fmt.Sprintf("ℹ️ Repo label `%s` was deleted, so the auto cherry-pick for `%s` was cleaned up (closed PR and deleted `%s`).", labelName, target, workBranch)),
+		})
 	}
 	return nil
 }
