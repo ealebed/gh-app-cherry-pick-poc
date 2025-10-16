@@ -9,11 +9,13 @@
 
 .bin
 **/.bin
+**/*.zip
 **/test
 **/*-bundle.yaml
 .env
 
 *.pem
+*.b64
 
 **/.DS_Store
 **/debug
