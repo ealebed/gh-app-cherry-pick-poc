@@ -37,6 +37,43 @@ type Processor struct {
 	CherryRunner CherryPickRunner
 }
 
+// sanitizeForLog removes control characters that could break log lines and
+// caps the length to prevent log flooding. Keep tabs for readability.
+func sanitizeForLog(s string) string {
+	if s == "" {
+		return s
+	}
+	// Strip CR, LF and other control chars except TAB.
+	sb := strings.Builder{}
+	sb.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\r':
+			// drop
+		case r < 0x20 && r != '\t':
+			// other control chars -> drop
+		case r == '\u2028' || r == '\u2029':
+			// line/paragraph separators -> drop
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	out := sb.String()
+	const max = 512
+	if len(out) > max {
+		out = out[:max] + "…"
+	}
+	return out
+}
+
+// safeErr renders an error as a sanitized string for logging.
+func safeErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return sanitizeForLog(err.Error())
+}
+
 // verifySig validates X-Hub-Signature-256 for a payload.
 func (p *Processor) verifySig(headers map[string]string, body []byte) bool {
 	sig := headers["X-Hub-Signature-256"]
@@ -72,22 +109,22 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 	body := []byte(env.Body)
 
 	if !p.verifySig(env.Headers, body) {
-		slog.Error("webhook.sig_mismatch", "delivery", deliveryID, "event", event)
+		slog.Error("webhook.sig_mismatch", "delivery", sanitizeForLog(deliveryID), "event", event)
 		return http.StatusUnauthorized, fmt.Errorf("signature mismatch")
 	}
-	slog.Debug("webhook.received", "delivery", deliveryID, "event", event)
+	slog.Debug("webhook.received", "delivery", sanitizeForLog(deliveryID), "event", event)
 
 	switch event {
 	case "pull_request":
 		var e github.PullRequestEvent
 		if err := json.Unmarshal(body, &e); err != nil {
-			slog.Error("webhook.bad_payload", "delivery", deliveryID, "err", err)
+			slog.Error("webhook.bad_payload", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 			return http.StatusBadRequest, fmt.Errorf("bad payload: %w", err)
 		}
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Error("webhook.panic", "delivery", deliveryID, "panic", r)
+					slog.Error("webhook.panic", "delivery", sanitizeForLog(deliveryID), "panic", r)
 				}
 			}()
 			p.handlePREvent(context.Background(), deliveryID, &e)
@@ -97,7 +134,7 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 	case "create":
 		var e github.CreateEvent
 		if err := json.Unmarshal(body, &e); err != nil {
-			slog.Error("webhook.bad_payload", "delivery", deliveryID, "err", err)
+			slog.Error("webhook.bad_payload", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 			return http.StatusBadRequest, fmt.Errorf("bad payload: %w", err)
 		}
 		go func() {
@@ -112,7 +149,7 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 		// and ALSO clean up autocherry artifacts for that target.
 		var e github.LabelEvent
 		if err := json.Unmarshal(body, &e); err != nil {
-			slog.Error("webhook.bad_payload", "delivery", deliveryID, "err", err)
+			slog.Error("webhook.bad_payload", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 			return http.StatusBadRequest, fmt.Errorf("bad payload: %w", err)
 		}
 		go func() {
@@ -129,12 +166,12 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 			}
 			inst := e.GetInstallation()
 			if inst == nil {
-				slog.Warn("label.no_installation", "delivery", deliveryID, "repo", owner+"/"+name)
+				slog.Warn("label.no_installation", "delivery", sanitizeForLog(deliveryID), "repo", owner+"/"+name)
 				return
 			}
 			clients, err := p.buildClients(inst.GetID())
 			if err != nil {
-				slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
+				slog.Error("gh.client_error", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 				return
 			}
 			gh := realGH{c: clients.REST}
@@ -149,22 +186,22 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 				return
 			}
 			if err := p.cleanupOpenAutoCherryForTarget(ctx2, gh, owner, name, target); err != nil {
-				slog.Error("labels.cleanup_fallback_error", "delivery", deliveryID, "label", labelName, "err", err)
+				slog.Error("labels.cleanup_fallback_error", "delivery", sanitizeForLog(deliveryID), "label", labelName, "err", safeErr(err))
 			} else {
-				slog.Info("labels.cleanup_fallback_done", "delivery", deliveryID, "label", labelName)
+				slog.Info("labels.cleanup_fallback_done", "delivery", sanitizeForLog(deliveryID), "label", labelName)
 			}
 		}()
 		return http.StatusAccepted, nil
 
 	default:
-		slog.Debug("webhook.ignore_event", "delivery", deliveryID, "event", event)
+		slog.Debug("webhook.ignore_event", "delivery", sanitizeForLog(deliveryID), "event", event)
 		return http.StatusNoContent, nil
 	}
 }
 
 func (p *Processor) handlePREvent(ctx context.Context, deliveryID string, e *github.PullRequestEvent) {
 	if e.GetInstallation() == nil {
-		slog.Warn("pr.no_installation", "delivery", deliveryID)
+		slog.Warn("pr.no_installation", "delivery", sanitizeForLog(deliveryID))
 		return
 	}
 	instID := e.GetInstallation().GetID()
@@ -203,7 +240,7 @@ func (p *Processor) handlePREvent(ctx context.Context, deliveryID string, e *git
 		}
 		clients, err := p.buildClients(instID)
 		if err != nil {
-			slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
+			slog.Error("gh.client_error", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 			return
 		}
 		gh := realGH{c: clients.REST}
@@ -232,7 +269,7 @@ func (p *Processor) handlePREvent(ctx context.Context, deliveryID string, e *git
 			safeTarget := strings.ReplaceAll(target, "/", "-")
 			workBranch := fmt.Sprintf("autocherry/%s/%s", safeTarget, short)
 			if err := p.processUnlabeled(ctx, gh, owner, name, prNum, target, workBranch); err != nil {
-				slog.Error("unlabeled.cleanup_error", "delivery", deliveryID, "target", target, "err", err)
+				slog.Error("unlabeled.cleanup_error", "delivery", sanitizeForLog(deliveryID), "target", target, "err", safeErr(err))
 			} else {
 				_, _, _ = gh.Issues().CreateComment(ctx, owner, name, prNum, &github.IssueComment{
 					Body: github.Ptr(fmt.Sprintf("ℹ️ Removed label for `%s`: closed any open auto-cherry-pick PR and deleted work branch `%s`.", target, workBranch)),
@@ -240,7 +277,7 @@ func (p *Processor) handlePREvent(ctx context.Context, deliveryID string, e *git
 			}
 		}
 	default:
-		slog.Debug("pr.skip", "delivery", deliveryID, "reason", "not_merged_or_not_labeled_after_merge")
+		slog.Debug("pr.skip", "delivery", sanitizeForLog(deliveryID), "reason", "not_merged_or_not_labeled_after_merge")
 	}
 }
 
@@ -257,7 +294,7 @@ func (p *Processor) cherryRunner() CherryPickRunner {
 func (p *Processor) processMergedPR(ctx context.Context, deliveryID string, installationID int64, owner, repo string, prNum int, targetsOverride []string) {
 	clients, err := p.buildClients(installationID)
 	if err != nil {
-		slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
+		slog.Error("gh.client_error", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 		return
 	}
 
@@ -268,13 +305,13 @@ func (p *Processor) processMergedPR(ctx context.Context, deliveryID string, inst
 	} else {
 		itr, ierr := ghinstallation.New(http.DefaultTransport, p.AppID, installationID, p.PrivateKeyPEM)
 		if ierr != nil {
-			slog.Error("gh.installation_transport_error", "delivery", deliveryID, "err", ierr)
+			slog.Error("gh.installation_transport_error", "delivery", sanitizeForLog(deliveryID), "err", safeErr(ierr))
 			return
 		}
 		token, err = itr.Token(ctx)
 	}
 	if err != nil || token == "" {
-		slog.Error("gh.installation_token_error", "delivery", deliveryID, "err", err)
+		slog.Error("gh.installation_token_error", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 		return
 	}
 
@@ -301,7 +338,7 @@ func (p *Processor) processMergedPRWith(
 	// Load PR
 	pr, _, err := gh.PR().Get(ctx, owner, repo, prNum)
 	if err != nil {
-		slog.Error("gh.get_pr_error", "delivery", deliveryID, "repo", owner+"/"+repo, "pr", prNum, "err", err)
+		slog.Error("gh.get_pr_error", "delivery", sanitizeForLog(deliveryID), "repo", owner+"/"+repo, "pr", prNum, "err", safeErr(err))
 		return
 	}
 
@@ -316,10 +353,10 @@ func (p *Processor) processMergedPRWith(
 				lbls = append(lbls, l.GetName())
 			}
 		}
-		slog.Debug("pr.labels", "delivery", deliveryID, "pr", prNum, "labels", lbls)
+		slog.Debug("pr.labels", "delivery", sanitizeForLog(deliveryID), "pr", prNum, "labels", lbls)
 		targets = cherry.ParseTargetBranches(pr.Labels)
 	}
-	slog.Info("pr.targets", "delivery", deliveryID, "pr", prNum, "targets", targets)
+	slog.Info("pr.targets", "delivery", sanitizeForLog(deliveryID), "pr", prNum, "targets", targets)
 	if len(targets) == 0 {
 		return
 	}
@@ -336,13 +373,13 @@ func (p *Processor) processMergedPRWith(
 		}
 		mergeSHA = commits[len(commits)-1].GetSHA()
 	}
-	slog.Info("pr.merge_sha", "delivery", deliveryID, "pr", prNum, "sha", mergeSHA)
+	slog.Info("pr.merge_sha", "delivery", sanitizeForLog(deliveryID), "pr", prNum, "sha", mergeSHA)
 
 	// Is the merged commit a merge?
 	rc, _, err := gh.Repos().GetCommit(ctx, owner, repo, mergeSHA, nil)
 	isMerge := (err == nil && rc != nil && len(rc.Parents) > 1)
 	if isMerge {
-		slog.Info("pr.merge_sha_is_merge_commit", "delivery", deliveryID, "sha", mergeSHA, "parents", len(rc.Parents))
+		slog.Info("pr.merge_sha_is_merge_commit", "delivery", sanitizeForLog(deliveryID), "sha", mergeSHA, "parents", len(rc.Parents))
 	}
 
 	// Short SHA for branch name suffix.
@@ -383,7 +420,7 @@ func (p *Processor) processMergedPRWith(
 			continue
 		}
 
-		slog.Info("cherry.start", "delivery", deliveryID, "target", target, "sha", mergeSHA, "isMerge", isMerge)
+		slog.Info("cherry.start", "delivery", sanitizeForLog(deliveryID), "target", target, "sha", mergeSHA, "isMerge", isMerge)
 
 		// Run cherry-pick via injected runner.
 		workBranchOut, cpErr := p.cherryRunner().Pick(ctx, owner, repo, token, target, mergeSHA, isMerge)
@@ -392,10 +429,10 @@ func (p *Processor) processMergedPRWith(
 				_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 					Body: github.Ptr(fmt.Sprintf("ℹ️ Auto cherry-pick to `%s`: no changes needed on target (commit already present or empty diff). Skipping PR.", target)),
 				})
-				slog.Info("cherry.noop", "delivery", deliveryID, "target", target, "sha", mergeSHA)
+				slog.Info("cherry.noop", "delivery", sanitizeForLog(deliveryID), "target", target, "sha", mergeSHA)
 				continue
 			}
-			slog.Warn("cherry.conflict", "delivery", deliveryID, "target", target, "err", cpErr)
+			slog.Warn("cherry.conflict", "delivery", sanitizeForLog(deliveryID), "target", target, "err", safeErr(cpErr))
 			_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 				Body: github.Ptr(fmt.Sprintf(
 					"⚠️ Auto cherry-pick to `%s` failed. Please create a patch branch from `%s` and cherry-pick `%s` manually.\n\nDetails: `%v`",
@@ -404,7 +441,7 @@ func (p *Processor) processMergedPRWith(
 			continue
 		}
 
-		slog.Info("cherry.pushed", "delivery", deliveryID, "work_branch", workBranchOut, "target", target)
+		slog.Info("cherry.pushed", "delivery", sanitizeForLog(deliveryID), "work_branch", workBranchOut, "target", target)
 
 		// Open PR into target
 		title := fmt.Sprintf("Auto cherry-pick: PR #%d — %s", pr.GetNumber(), pr.GetTitle())
@@ -416,13 +453,13 @@ func (p *Processor) processMergedPRWith(
 			Body:  github.Ptr(body),
 		})
 		if err != nil {
-			slog.Error("gh.create_pr_error", "delivery", deliveryID, "target", target, "err", err)
+			slog.Error("gh.create_pr_error", "delivery", sanitizeForLog(deliveryID), "target", target, "err", safeErr(err))
 			_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 				Body: github.Ptr(fmt.Sprintf("⚠️ Auto cherry-pick to `%s`: failed to open PR: %v", target, err)),
 			})
 			continue
 		}
-		slog.Info("gh.pr_opened", "delivery", deliveryID, "url", newPR.GetHTMLURL(), "target", target)
+		slog.Info("gh.pr_opened", "delivery", sanitizeForLog(deliveryID), "url", newPR.GetHTMLURL(), "target", target)
 
 		_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 			Body: github.Ptr(fmt.Sprintf("✅ Auto cherry-pick to `%s` opened: %s", target, newPR.GetHTMLURL())),
@@ -442,32 +479,32 @@ func (p *Processor) handleCreateEvent(ctx context.Context, deliveryID string, e 
 	re := regexp.MustCompile(`^([a-z0-9-]+-release)/(\d{4})$`)
 	m := re.FindStringSubmatch(ref)
 	if len(m) != 3 {
-		slog.Debug("create.ignore_branch", "delivery", deliveryID, "ref", ref)
+		slog.Debug("create.ignore_branch", "delivery", sanitizeForLog(deliveryID), "ref", ref)
 		return
 	}
 
 	inst := e.GetInstallation()
 	if inst == nil {
-		slog.Warn("create.no_installation", "delivery", deliveryID, "repo", owner+"/"+name)
+		slog.Warn("create.no_installation", "delivery", sanitizeForLog(deliveryID), "repo", owner+"/"+name)
 		return
 	}
 	clients, err := p.buildClients(inst.GetID())
 	if err != nil {
-		slog.Error("gh.client_error", "delivery", deliveryID, "err", err)
+		slog.Error("gh.client_error", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 		return
 	}
 	gh := realGH{c: clients.REST}
 
 	label := "cherry-pick to " + ref
 	if err := p.ensureLabel(ctx, gh, owner, name, label); err != nil {
-		slog.Error("labels.ensure_error", "delivery", deliveryID, "label", label, "err", err)
+		slog.Error("labels.ensure_error", "delivery", sanitizeForLog(deliveryID), "label", label, "err", safeErr(err))
 	} else {
-		slog.Info("labels.created_or_exists", "delivery", deliveryID, "label", label)
+		slog.Info("labels.created_or_exists", "delivery", sanitizeForLog(deliveryID), "label", label)
 	}
 
 	// Retain only latest 5 labels per family, with pre-deletion cleanup.
 	if err := p.enforceLabelRetention(ctx, gh, owner, name, 5); err != nil {
-		slog.Error("labels.retention_error", "delivery", deliveryID, "err", err)
+		slog.Error("labels.retention_error", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 	}
 }
 
