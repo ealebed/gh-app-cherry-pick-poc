@@ -49,6 +49,8 @@ func main() {
 		WebhookSecret: cfg.WebhookSecret,
 		GitUserName:   cfg.GitUserName,
 		GitUserEmail:  cfg.GitUserEmail,
+		// Make the per-PR processing timeout configurable.
+		CherryTimeout: time.Duration(cfg.CherryTimeoutSeconds) * time.Second,
 	}
 
 	// AWS SDK v2 config + SQS client.

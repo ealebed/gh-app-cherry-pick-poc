@@ -27,6 +27,9 @@ type Config struct {
 	SQSVisibilityTimeout  int32
 	SQSDeleteOn4xx        bool
 	SQSExtendOnProcessing bool
+
+	// Processing
+	CherryTimeoutSeconds int // max time to process one merged PR (incl. git ops)
 }
 
 func Load() (*Config, error) {
@@ -71,6 +74,9 @@ func Load() (*Config, error) {
 		SQSVisibilityTimeout:  int32(envOrInt("SQS_VISIBILITY_TIMEOUT", 120)),
 		SQSDeleteOn4xx:        envOrBool("SQS_DELETE_ON_4XX", true),
 		SQSExtendOnProcessing: envOrBool("SQS_EXTEND_ON_PROCESSING", false),
+
+		// Give slow repos enough time; make it easy to override
+		CherryTimeoutSeconds: envOrInt("CHERRY_TIMEOUT_SECONDS", 600),
 	}, nil
 }
 
