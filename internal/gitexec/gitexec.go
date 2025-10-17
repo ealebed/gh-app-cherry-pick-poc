@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -21,7 +22,14 @@ func NewRunner(baseDir string, extraEnv ...string) (*Runner, error) {
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	td, err := os.MkdirTemp(dir, "cherry-*")
+	// Basic normalization & absolute path to reduce surprises (and address CodeGuru hint).
+	clean := filepath.Clean(dir)
+	if !filepath.IsAbs(clean) {
+		if abs, err := filepath.Abs(clean); err == nil {
+			clean = abs
+		}
+	}
+	td, err := os.MkdirTemp(clean, "cherry-*")
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +57,7 @@ func (r *Runner) run(ctx context.Context, name string, args ...string) error {
 	if err != nil {
 		s := out.String()
 		slog.Error("git.fail", "cmd", name, "args", safeArgs, "err", err, "out", s)
-		return fmt.Errorf("%s %s failed: %v\n%s", name, strings.Join(safeArgs, " "), err, s)
+		return fmt.Errorf("%s %s failed: %v", name, strings.Join(safeArgs, " "), err)
 	}
 	if s := strings.TrimSpace(out.String()); s != "" {
 		slog.Debug("git.out", "cmd", name, "out", s)
@@ -61,7 +69,8 @@ func (r *Runner) Clean() { _ = os.RemoveAll(r.WorkDir) }
 
 func (r *Runner) CloneWithToken(ctx context.Context, owner, repo, token string) error {
 	url := fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", token, owner, repo)
-	if err := r.run(ctx, "git", "init"); err != nil {
+	// Enable protocol v2 up-front; helps partial clone/fetch filters.
+	if err := r.run(ctx, "git", "-c", "protocol.version=2", "init"); err != nil {
 		return err
 	}
 	if err := r.run(ctx, "git", "remote", "add", "origin", url); err != nil {
@@ -78,8 +87,18 @@ func (r *Runner) ConfigUser(ctx context.Context, name, email string) error {
 	return r.run(ctx, "git", "config", "user.email", email)
 }
 
+// Fetch performs a shallow, partial fetch to keep it fast and memory-light.
+// Depth 200 is a pragmatic default; adjust here if you ever need more history.
 func (r *Runner) Fetch(ctx context.Context, refspec ...string) error {
-	args := append([]string{"fetch", "--prune", "origin"}, refspec...)
+	args := []string{
+		"fetch",
+		"--prune",
+		"--no-tags",
+		"--depth", "200",
+		"--filter=blob:none",
+		"origin",
+	}
+	args = append(args, refspec...)
 	return r.run(ctx, "git", args...)
 }
 

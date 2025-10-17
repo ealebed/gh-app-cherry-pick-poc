@@ -31,6 +31,9 @@ type Processor struct {
 	GitUserName   string
 	GitUserEmail  string
 
+	// Configurable timeout for a single merged-PR processing (clone/fetch/cherry/push).
+	CherryTimeout time.Duration
+
 	// Test seams
 	NewClients   func(appID, installationID int64, pem []byte) (*githubapp.Clients, error)
 	GetToken     func(ctx context.Context, appID, installationID int64, pem []byte) (string, error)
@@ -180,7 +183,6 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 			_ = p.removeLabelFromOpenPRs(ctx2, gh, owner, name, labelName)
 
 			// 2) Fallback cleanup: label is already deleted, so we can't query history by label.
-			//    We can still close open autocherry PRs for the target by scanning branch names.
 			target := strings.TrimSpace(strings.TrimPrefix(labelName, "cherry-pick to "))
 			if target == "" {
 				return
@@ -229,7 +231,12 @@ func (p *Processor) handlePREvent(ctx context.Context, deliveryID string, e *git
 
 	switch {
 	case (action == "closed" && merged) || (action == "labeled" && merged):
-		cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		// Use configurable timeout; default to 2m if not set.
+		to := p.CherryTimeout
+		if to <= 0 {
+			to = 2 * time.Minute
+		}
+		cctx, cancel := context.WithTimeout(ctx, to)
 		defer cancel()
 		p.processMergedPR(cctx, deliveryID, instID, owner, name, prNum, targetsOverride)
 

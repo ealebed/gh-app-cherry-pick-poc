@@ -79,6 +79,7 @@ If a labeled branch doesn’t exist, the app comments and skips that target.
 - `AWS_REGION` - optional (default `eu-north-1`)
 - `GITHUB_APP_ID` — your GitHub App ID (integer)
 - `GITHUB_WEBHOOK_SECRET` — the webhook secret you set in the app
+- `CHERRY_TIMEOUT_SECONDS` — nn busy repos (or over a slow link), `git fetch` can exceed default 2 minutes. Increase if needed
 - **Provide the app private key via one of:**
   - `GITHUB_APP_PRIVATE_KEY_PEM_BASE64` — **base64** of the PEM contents
   - `GITHUB_APP_PRIVATE_KEY_PEM` — raw PEM contents (if you’ve wired it this way)
@@ -99,6 +100,7 @@ Create `.env` (or export vars directly):
 GITHUB_APP_ID=123456
 GITHUB_WEBHOOK_SECRET=your-very-secret-string
 GITHUB_APP_PRIVATE_KEY_PEM_BASE64=<<<paste base64 of your PEM here>>>
+CHERRY_TIMEOUT_SECONDS=600
 LISTEN_PORT=:8080
 LOG_LEVEL=debug
 AWS_REGION=eu-north-1
