@@ -3,7 +3,7 @@ name: "Terraform Apply"
 on:
   push:
     branches:
-      - main
+      - master
     paths:
       - 'terraform/**.tf'
       - '.github/workflows/terraform-plan.yml'
