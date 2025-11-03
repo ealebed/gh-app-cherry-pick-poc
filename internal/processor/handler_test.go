@@ -97,6 +97,7 @@ func (f *fakePRFull) Create(ctx context.Context, owner, repo string, pr *github.
 	}
 	f.createdPR = &github.PullRequest{
 		HTMLURL: github.Ptr("https://example.com/newpr"),
+		// Number intentionally omitted; tests don't rely on it
 	}
 	return f.createdPR, nil, nil
 }
@@ -122,8 +123,12 @@ type fakeIssuesFull struct {
 		Num  int
 		Name string
 	}
-	created []*github.Label
-	deleted []string
+	created      []*github.Label
+	deleted      []string
+	addedToIssue []struct {
+		Num    int
+		Labels []string
+	}
 }
 
 func (f *fakeIssuesFull) CreateComment(ctx context.Context, owner, repo string, number int, comment *github.IssueComment) (*github.IssueComment, *github.Response, error) {
@@ -138,10 +143,8 @@ func (f *fakeIssuesFull) ListByRepo(ctx context.Context, owner, repo string, opt
 		}
 
 		// Filter by state if provided (e.g., "open")
-		if opts != nil && opts.State != "" {
-			if !strings.EqualFold(is.GetState(), opts.State) {
-				continue
-			}
+		if opts != nil && opts.State != "" && !strings.EqualFold(is.GetState(), opts.State) {
+			continue
 		}
 
 		// Filter by labels (support multiple)
@@ -195,6 +198,18 @@ func (f *fakeIssuesFull) DeleteLabel(ctx context.Context, owner, repo, name stri
 	}
 	f.deleted = append(f.deleted, name)
 	return &github.Response{Response: &http.Response{StatusCode: 204}}, nil
+}
+
+func (f *fakeIssuesFull) AddLabelsToIssue(ctx context.Context, owner, repo string, number int, labels []string) ([]*github.Label, *github.Response, error) {
+	f.addedToIssue = append(f.addedToIssue, struct {
+		Num    int
+		Labels []string
+	}{Num: number, Labels: append([]string(nil), labels...)})
+	out := make([]*github.Label, 0, len(labels))
+	for _, s := range labels {
+		out = append(out, &github.Label{Name: github.Ptr(s)})
+	}
+	return out, &github.Response{Response: &http.Response{StatusCode: 200}}, nil
 }
 
 type fakeGitFull struct {

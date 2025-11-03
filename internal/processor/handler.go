@@ -349,6 +349,12 @@ func (p *Processor) processMergedPRWith(
 		return
 	}
 
+	// Resolve original author login (best-effort).
+	origAuthor := ""
+	if pr.User != nil && pr.User.Login != nil {
+		origAuthor = pr.User.GetLogin()
+	}
+
 	// Targets: override or parse labels.
 	var targets []string
 	if len(targetsOverride) > 0 {
@@ -450,9 +456,13 @@ func (p *Processor) processMergedPRWith(
 
 		slog.Info("cherry.pushed", "delivery", sanitizeForLog(deliveryID), "work_branch", workBranchOut, "target", target)
 
-		// Open PR into target
+		// Open PR into target — include a footer with the original author (if available).
 		title := fmt.Sprintf("Auto cherry-pick: PR #%d — %s", pr.GetNumber(), pr.GetTitle())
 		body := fmt.Sprintf("Automated cherry-pick of PR #%d into `%s`.\n\nCommit: `%s`", pr.GetNumber(), target, mergeSHA)
+		if origAuthor != "" {
+			body += fmt.Sprintf("\n\n---\n_origin: PR #%d by @%s (commit %s)_", pr.GetNumber(), origAuthor, short)
+		}
+
 		newPR, _, err := gh.PR().Create(ctx, owner, repo, &github.NewPullRequest{
 			Title: github.Ptr(title),
 			Head:  github.Ptr(workBranchOut),
@@ -467,6 +477,14 @@ func (p *Processor) processMergedPRWith(
 			continue
 		}
 		slog.Info("gh.pr_opened", "delivery", sanitizeForLog(deliveryID), "url", newPR.GetHTMLURL(), "target", target)
+
+		// Add a machine-readable label for automation: "orig-author:<login>"
+		if origAuthor != "" && newPR.Number != nil {
+			label := "orig-author:" + origAuthor
+			if _, _, lerr := gh.Issues().AddLabelsToIssue(ctx, owner, repo, newPR.GetNumber(), []string{label}); lerr != nil {
+				slog.Warn("gh.add_label_error", "delivery", sanitizeForLog(deliveryID), "pr", newPR.GetNumber(), "label", label, "err", safeErr(lerr))
+			}
+		}
 
 		_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
 			Body: github.Ptr(fmt.Sprintf("✅ Auto cherry-pick to `%s` opened: %s", target, newPR.GetHTMLURL())),

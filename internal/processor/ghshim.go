@@ -25,6 +25,9 @@ type IssuesAPI interface {
 	ListLabels(ctx context.Context, owner, repo string, opts *github.ListOptions) ([]*github.Label, *github.Response, error)
 	CreateLabel(ctx context.Context, owner, repo string, label *github.Label) (*github.Label, *github.Response, error)
 	DeleteLabel(ctx context.Context, owner, repo, name string) (*github.Response, error)
+
+	// NEW: needed so we can attach "orig-author:<login>" to the cherry-pick PR.
+	AddLabelsToIssue(ctx context.Context, owner, repo string, number int, labels []string) ([]*github.Label, *github.Response, error)
 }
 
 type GitAPI interface {
