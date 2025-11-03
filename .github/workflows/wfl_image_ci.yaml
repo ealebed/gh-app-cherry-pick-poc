@@ -3,8 +3,24 @@ name: 'Container image CI'
 on:
   push:
     branches: [ "master" ]
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - 'internal/**.go'
+      - 'cmd/**.go'
+      - '.github/workflows/wfl_image_ci.yaml'
+      - '.github/workflows/tpl_*.yml'
   pull_request:
     branches: [ "master" ]
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - 'internal/**.go'
+      - 'cmd/**.go'
+      - '.github/workflows/wfl_image_ci.yaml'
+      - '.github/workflows/tpl_*.yml'
   workflow_dispatch:
     inputs:
       branch:
