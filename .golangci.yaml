@@ -1,33 +1,99 @@
 version: "2"
 
 run:
-  timeout: 3m
+  timeout: 5m
+  issues-exit-code: 2
   tests: false
 
 linters:
-  # disable everything, then opt-in the few you want
   default: none
   enable:
-    - govet
-    - staticcheck
+    - bodyclose
+    - depguard
+    - dogsled
+    - dupl
     - errcheck
+    - importas
+    - funlen
+    - goconst
+    - gocritic
+    - gocyclo
+    - gosec
+    - govet
     - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - nolintlint
+    - staticcheck
+    - unconvert
+    - unparam
     - unused
-  exclusions:
-    # optional: treat "generated" laxly; remove if you don't need it
-    generated: lax
-    paths:
-      - ^vendor/
-      - ^deploy/
-      - ^\.github/
-      - ^build/
-      - ^dist/
-      - ^mocks/
+    - whitespace
+  settings:
+    depguard:
+      rules:
+        main:
+          files:
+            - $all
+            - "!$test"
+          allow:
+            - $gostd
+            - github.com/ealebed/gh-app-cherry-pick-poc/internal
+            - github.com/aws/aws-sdk-go-v2
+            - github.com/aws/aws-sdk-go-v2/config
+            - github.com/aws/aws-sdk-go-v2/service/sqs
+            - github.com/bradleyfalzon/ghinstallation/v2
+            - github.com/google/go-github/v75
+            - github.com/joho/godotenv
+    govet:
+      enable:
+        - nilness
+        - shadow
+    gocyclo:
+      min-complexity: 15
+    dupl:
+      threshold: 100
+    goconst:
+      min-len: 2
+      min-occurrences: 3
+    misspell:
+      locale: US
+    importas:
+      alias:
+        - pkg: github.com/aws/aws-sdk-go-v2/config
+          alias: awscfg
+        - pkg: github.com/aws/aws-sdk-go-v2/service/sqs
+          alias: awssqs
+    lll:
+      line-length: 160
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - dupImport # https://github.com/go-critic/go-critic/issues/845
+        - ifElseChain
+        - octalLiteral
+        - rangeValCopy
+        - unnamedResult
+        - whyNoLint
+        - wrapperFunc
+    funlen:
+      lines: -1
+      statements: 50
 
 formatters:
   enable:
     - gofmt
     - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/ealebed/gh-app-cherry-pick-poc
 
 issues:
   max-issues-per-linter: 0

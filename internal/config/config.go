@@ -16,8 +16,8 @@ type Config struct {
 	ListenPort    string // ":8080"
 
 	// Optional Git actor
-	GitUserName  string // "stabilisation-bot"
-	GitUserEmail string // "stabilisation-bot@users.noreply.github.com"
+	GitUserName  string // "stabilization-bot"
+	GitUserEmail string // "stabilization-bot@users.noreply.github.com"
 
 	// AWS/SQS
 	AWSRegion             string
@@ -64,14 +64,14 @@ func Load() (*Config, error) {
 		WebhookSecret: []byte(secret),
 		PrivateKeyPEM: pem,
 		ListenPort:    listenPort,
-		GitUserName:   envOr("GIT_USER_NAME", "stabilisation-bot"),
-		GitUserEmail:  envOr("GIT_USER_EMAIL", "stabilisation-bot@users.noreply.github.com"),
+		GitUserName:   envOr("GIT_USER_NAME", "stabilization-bot"),
+		GitUserEmail:  envOr("GIT_USER_EMAIL", "stabilization-bot@users.noreply.github.com"),
 
 		AWSRegion:             awsRegion,
 		SQSQueueURL:           queueURL,
-		SQSMaxMessages:        int32(envOrInt("SQS_MAX_MESSAGES", 10)),
-		SQSWaitTimeSeconds:    int32(envOrInt("SQS_WAIT_TIME_SECONDS", 10)),
-		SQSVisibilityTimeout:  int32(envOrInt("SQS_VISIBILITY_TIMEOUT", 120)),
+		SQSMaxMessages:        safeInt32(envOrInt("SQS_MAX_MESSAGES", 10)),
+		SQSWaitTimeSeconds:    safeInt32(envOrInt("SQS_WAIT_TIME_SECONDS", 10)),
+		SQSVisibilityTimeout:  safeInt32(envOrInt("SQS_VISIBILITY_TIMEOUT", 120)),
 		SQSDeleteOn4xx:        envOrBool("SQS_DELETE_ON_4XX", true),
 		SQSExtendOnProcessing: envOrBool("SQS_EXTEND_ON_PROCESSING", false),
 
@@ -106,4 +106,17 @@ func envOrBool(k string, def bool) bool {
 		}
 	}
 	return def
+}
+
+// safeInt32 converts int to int32 with bounds checking to avoid overflow.
+func safeInt32(n int) int32 {
+	const maxInt32 = int32(^uint32(0) >> 1)
+	const minInt32 = -maxInt32 - 1
+	if n > int(maxInt32) {
+		return maxInt32
+	}
+	if n < int(minInt32) {
+		return minInt32
+	}
+	return int32(n)
 }

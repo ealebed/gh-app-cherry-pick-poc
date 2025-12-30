@@ -62,9 +62,9 @@ func sanitizeForLog(s string) string {
 		}
 	}
 	out := sb.String()
-	const max = 512
-	if len(out) > max {
-		out = out[:max] + "…"
+	const maxLength = 512
+	if len(out) > maxLength {
+		out = out[:maxLength] + "…"
 	}
 	return out
 }
@@ -106,6 +106,8 @@ func (p *Processor) HandleEvent(ctx context.Context, event, delivery string, bod
 }
 
 // HandleFromEnvelope processes one queue envelope (from internal/queue.Parser).
+//
+//nolint:gocyclo,funlen // Complex event routing with multiple event types
 func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (int, error) {
 	deliveryID := env.Headers["X-GitHub-Delivery"]
 	event := env.Headers["X-GitHub-Event"]
@@ -201,6 +203,7 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 	}
 }
 
+//nolint:gocyclo // Complex event handling logic with multiple branches
 func (p *Processor) handlePREvent(ctx context.Context, deliveryID string, e *github.PullRequestEvent) {
 	if e.GetInstallation() == nil {
 		slog.Warn("pr.no_installation", "delivery", sanitizeForLog(deliveryID))
@@ -333,6 +336,7 @@ func (p *Processor) buildClients(installationID int64) (*githubapp.Clients, erro
 	return githubapp.NewClients(p.AppID, installationID, p.PrivateKeyPEM)
 }
 
+//nolint:gocyclo,funlen // Complex cherry-pick processing with multiple branches and error handling
 func (p *Processor) processMergedPRWith(
 	ctx context.Context,
 	deliveryID string,
@@ -377,10 +381,10 @@ func (p *Processor) processMergedPRWith(
 	// Determine merged commit SHA.
 	mergeSHA := pr.GetMergeCommitSHA()
 	if mergeSHA == "" {
-		commits, _, err := gh.PR().ListCommits(ctx, owner, repo, prNum, &github.ListOptions{PerPage: 250})
-		if err != nil || len(commits) == 0 {
+		commits, _, listErr := gh.PR().ListCommits(ctx, owner, repo, prNum, &github.ListOptions{PerPage: 250})
+		if listErr != nil || len(commits) == 0 {
 			_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
-				Body: github.Ptr(fmt.Sprintf("⚠️ Could not determine merged commit SHA for PR #%d: %v", prNum, err)),
+				Body: github.Ptr(fmt.Sprintf("⚠️ Could not determine merged commit SHA for PR #%d: %v", prNum, listErr)),
 			})
 			return
 		}
@@ -605,6 +609,8 @@ func (p *Processor) enforceLabelRetention(ctx context.Context, gh GH, owner, rep
 
 // For labels that still exist (retention path): find PRs by label (state=all).
 // For merged PRs, compute work branch and call processUnlabeled.
+//
+//nolint:gocyclo // Complex cleanup logic with multiple conditions
 func (p *Processor) cleanupForLabel(ctx context.Context, gh GH, owner, repo, labelName string) error {
 	const prefix = "cherry-pick to "
 	if !strings.HasPrefix(labelName, prefix) {
@@ -657,7 +663,9 @@ func (p *Processor) cleanupForLabel(ctx context.Context, gh GH, owner, repo, lab
 			continue
 		}
 		_, _, _ = gh.Issues().CreateComment(ctx, owner, repo, prNum, &github.IssueComment{
-			Body: github.Ptr(fmt.Sprintf("ℹ️ Repo label `%s` is being removed; cleaned up auto cherry-pick for `%s` (closed PR and deleted `%s`).", labelName, target, workBranch)),
+			Body: github.Ptr(fmt.Sprintf(
+				"ℹ️ Repo label `%s` is being removed; cleaned up auto cherry-pick for `%s` (closed PR and deleted `%s`).",
+				labelName, target, workBranch)),
 		})
 	}
 	return nil
@@ -717,7 +725,7 @@ func (p *Processor) removeLabelFromOpenPRs(ctx context.Context, gh GH, owner, re
 	return nil
 }
 
-func (p *Processor) processUnlabeled(ctx context.Context, gh GH, owner, repo string, mainPRNumber int, target, workBranch string) error {
+func (p *Processor) processUnlabeled(ctx context.Context, gh GH, owner, repo string, _ int, target, workBranch string) error {
 	prs, _, err := gh.PR().List(ctx, owner, repo, &github.PullRequestListOptions{
 		State:       "open",
 		Base:        target,

@@ -30,7 +30,9 @@ type Worker struct {
 	Processor Handler
 }
 
-// Run starts a long-poll receive loop until ctx is cancelled.
+// Run starts a long-poll receive loop until ctx is canceled.
+//
+//nolint:gocyclo // Complex SQS polling loop with multiple error handling paths
 func (w *Worker) Run(ctx context.Context) error {
 	if w.Client == nil || w.QueueURL == "" || w.Processor == nil {
 		return errors.New("sqs.Worker: missing Client, QueueURL or Processor")
