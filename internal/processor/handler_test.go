@@ -635,6 +635,117 @@ func Test_isNotFound(t *testing.T) {
 	}
 }
 
+func Test_sanitizeForLog(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "empty string",
+			input: "",
+			want:  "",
+		},
+		{
+			name:  "normal string",
+			input: "hello world",
+			want:  "hello world",
+		},
+		{
+			name:  "removes newlines",
+			input: "hello\nworld",
+			want:  "helloworld",
+		},
+		{
+			name:  "removes carriage returns",
+			input: "hello\rworld",
+			want:  "helloworld",
+		},
+		{
+			name:  "removes control chars but keeps tab",
+			input: "hello\tworld",
+			want:  "hello\tworld",
+		},
+		{
+			name:  "removes unicode line separators",
+			input: "hello\u2028world\u2029",
+			want:  "helloworld",
+		},
+		{
+			name:  "truncates long strings",
+			input: strings.Repeat("a", 600),
+			want:  strings.Repeat("a", 512) + "…",
+		},
+		{
+			name:  "exactly 512 chars",
+			input: strings.Repeat("a", 512),
+			want:  strings.Repeat("a", 512),
+		},
+		{
+			name:  "513 chars gets truncated",
+			input: strings.Repeat("a", 513),
+			want:  strings.Repeat("a", 512) + "…",
+		},
+		{
+			name:  "mixed control chars",
+			input: "hello\x00\x01\x02world",
+			want:  "helloworld",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeForLog(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeForLog(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_safeErr(t *testing.T) {
+	tests := []struct {
+		name  string
+		input error
+		want  string
+	}{
+		{
+			name:  "nil error",
+			input: nil,
+			want:  "",
+		},
+		{
+			name:  "normal error",
+			input: errors.New("something went wrong"),
+			want:  "something went wrong",
+		},
+		{
+			name:  "error with newlines",
+			input: errors.New("error\nwith\nnewlines"),
+			want:  "errorwithnewlines",
+		},
+		{
+			name:  "error with control chars",
+			input: errors.New("error\x00\x01\x02"),
+			want:  "error",
+		},
+		{
+			name:  "long error gets truncated",
+			input: errors.New(strings.Repeat("a", 600)),
+			want:  strings.Repeat("a", 512) + "…",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := safeErr(tt.input)
+			if got != tt.want {
+				t.Errorf("safeErr(%v) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 // ---------- (Optional) compile-time checks for ghshim.go ----------
 var (
 	_ PullRequestsAPI = (*github.PullRequestsService)(nil)
