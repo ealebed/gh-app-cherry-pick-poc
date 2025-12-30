@@ -65,3 +65,76 @@ func TestParseTargetBranches(t *testing.T) {
 		})
 	}
 }
+
+func Test_splitBranches(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			name:  "comma separated",
+			input: "branch1, branch2, branch3",
+			want:  []string{"branch1", "branch2", "branch3"},
+		},
+		{
+			name:  "space separated",
+			input: "branch1 branch2 branch3",
+			want:  []string{"branch1", "branch2", "branch3"},
+		},
+		{
+			name:  "mixed comma and space",
+			input: "branch1, branch2 branch3",
+			want:  []string{"branch1", "branch2", "branch3"},
+		},
+		{
+			name:  "single branch",
+			input: "branch1",
+			want:  []string{"branch1"},
+		},
+		{
+			name:  "empty string",
+			input: "",
+			want:  []string{},
+		},
+		{
+			name:  "whitespace only",
+			input: "   ",
+			want:  []string{},
+		},
+		{
+			name:  "with extra spaces",
+			input: "  branch1  ,  branch2  ",
+			want:  []string{"branch1", "branch2"},
+		},
+		{
+			name:  "multiple spaces between branches",
+			input: "branch1    branch2",
+			want:  []string{"branch1", "branch2"},
+		},
+		{
+			name:  "empty segments",
+			input: "branch1,,branch2",
+			want:  []string{"branch1", "branch2"},
+		},
+		{
+			name:  "trailing comma",
+			input: "branch1, branch2,",
+			want:  []string{"branch1", "branch2"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitBranches(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("len mismatch: got=%v want=%v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("idx %d: got=%q want=%q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
