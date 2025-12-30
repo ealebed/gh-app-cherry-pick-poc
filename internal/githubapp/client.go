@@ -13,7 +13,7 @@ type Clients struct {
 }
 
 // NewClients creates an installation-scoped client for a given installation ID.
-func NewClients(appID int64, installationID int64, pem []byte) (*Clients, error) {
+func NewClients(appID, installationID int64, pem []byte) (*Clients, error) {
 	tr := http.DefaultTransport
 	itr, err := ghinstallation.New(tr, appID, installationID, pem)
 	if err != nil {

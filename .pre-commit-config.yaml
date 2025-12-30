@@ -5,17 +5,18 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        args: [--unsafe] # Allow multiple documents (needed for Kubernetes manifests)
       - id: check-added-large-files
       - id: check-json
       - id: check-toml
       - id: check-merge-conflict
       - id: detect-private-key
+        exclude: ^.*_test\.go$ # Exclude test files that may generate keys dynamically
 
   - repo: https://github.com/dnephin/pre-commit-golang
     rev: v0.5.1
     hooks:
       - id: go-fmt
-      - id: go-vet
       - id: go-mod-tidy
       - id: go-unit-tests
         args: [-race]

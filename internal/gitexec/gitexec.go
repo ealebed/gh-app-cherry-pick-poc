@@ -38,8 +38,8 @@ func NewRunner(baseDir string, extraEnv ...string) (*Runner, error) {
 
 var reToken = regexp.MustCompile(`x-access-token:[^@]+@`)
 
-func (r *Runner) run(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
+func (r *Runner) run(ctx context.Context, _ string, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = r.WorkDir
 	cmd.Env = r.Env
 
@@ -52,15 +52,15 @@ func (r *Runner) run(ctx context.Context, name string, args ...string) error {
 		safeArgs[i] = reToken.ReplaceAllString(a, "x-access-token:***@")
 	}
 
-	slog.Debug("git.exec", "cwd", r.WorkDir, "cmd", name, "args", safeArgs)
+	slog.Debug("git.exec", "cwd", r.WorkDir, "cmd", "git", "args", safeArgs)
 	err := cmd.Run()
 	if err != nil {
 		s := out.String()
-		slog.Error("git.fail", "cmd", name, "args", safeArgs, "err", err, "out", s)
-		return fmt.Errorf("%s %s failed: %v", name, strings.Join(safeArgs, " "), err)
+		slog.Error("git.fail", "cmd", "git", "args", safeArgs, "err", err, "out", s)
+		return fmt.Errorf("git %s failed: %v", strings.Join(safeArgs, " "), err)
 	}
 	if s := strings.TrimSpace(out.String()); s != "" {
-		slog.Debug("git.out", "cmd", name, "out", s)
+		slog.Debug("git.out", "cmd", "git", "out", s)
 	}
 	return nil
 }
