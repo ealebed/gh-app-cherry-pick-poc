@@ -25,7 +25,7 @@ jobs:
     steps:
         # Checkout checks out the repository
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
         # Upload Configuration uploads the Terraform configuration to HCP Terraform and marks it as speculative so it cannot modify infrastructure
       - name: Upload Configuration

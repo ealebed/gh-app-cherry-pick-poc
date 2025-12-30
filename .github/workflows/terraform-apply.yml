@@ -26,7 +26,7 @@ jobs:
     steps:
         # Checkout checks out the current configuration
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
         # Upload Configuration uploads the Terraform configuration to HCP Terraform
       - name: Upload Configuration
