@@ -68,8 +68,8 @@ resource "aws_iam_policy" "ecs_exec_read_secrets" {
       Effect = "Allow",
       Action = ["secretsmanager:GetSecretValue"],
       Resource = [
-        data.aws_secretsmanager_secret.webhook_secret.arn,
-        data.aws_secretsmanager_secret.github_key_b64.arn
+        local.webhook_secret_arn,
+        local.github_key_secret_arn
       ]
     }]
   })
@@ -109,8 +109,8 @@ resource "aws_ecs_task_definition" "worker" {
         { name = "CHERRY_TIMEOUT_SECONDS", value = "600" },
       ],
       secrets = [
-        { name = "GITHUB_WEBHOOK_SECRET", valueFrom = data.aws_secretsmanager_secret.webhook_secret.arn },
-        { name = "GITHUB_APP_PRIVATE_KEY_PEM_BASE64", valueFrom = data.aws_secretsmanager_secret.github_key_b64.arn }
+        { name = "GITHUB_WEBHOOK_SECRET", valueFrom = local.webhook_secret_arn },
+        { name = "GITHUB_APP_PRIVATE_KEY_PEM_BASE64", valueFrom = local.github_key_secret_arn }
       ],
       logConfiguration = {
         logDriver = "awslogs",

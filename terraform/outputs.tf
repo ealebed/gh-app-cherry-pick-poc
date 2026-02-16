@@ -7,7 +7,7 @@ output "caller_arn" {
 }
 
 output "active_region" {
-  value = data.aws_region.current.name
+  value = data.aws_region.current.id
 }
 
 output "sqs_queue_url" {
