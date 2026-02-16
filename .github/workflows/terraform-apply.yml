@@ -1,12 +1,12 @@
 name: "Terraform Apply"
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - 'terraform/**.tf'
-      - '.github/workflows/terraform-plan.yml'
+  # push:
+  #   branches:
+  #     - master
+  #   paths:
+  #     - 'terraform/**.tf'
+  #     - '.github/workflows/terraform-plan.yml'
   workflow_dispatch:
 
 env:
@@ -26,13 +26,14 @@ jobs:
     steps:
         # Checkout checks out the current configuration
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
         # Upload Configuration uploads the Terraform configuration to HCP Terraform
       - name: Upload Configuration
         uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.3.2
         id: apply-upload
         with:
+          token: ${{ env.TF_API_TOKEN }}
           workspace: ${{ env.TF_WORKSPACE }}
           directory: ${{ env.CONFIG_DIRECTORY }}
 
