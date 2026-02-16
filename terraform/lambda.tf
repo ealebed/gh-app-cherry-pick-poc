@@ -32,7 +32,7 @@ resource "aws_iam_policy" "lambda_extra" {
       {
         Effect   = "Allow",
         Action   = ["secretsmanager:GetSecretValue"],
-        Resource = data.aws_secretsmanager_secret.webhook_secret.arn
+        Resource = local.webhook_secret_arn
       },
       {
         Effect   = "Allow",
@@ -61,7 +61,7 @@ resource "aws_lambda_function" "webhook_validator" {
   environment {
     variables = {
       # We'll pass the *name* of the secret, Lambda fetches it at runtime (kept warm across invocations).
-      GITHUB_WEBHOOK_SECRET_NAME = data.aws_secretsmanager_secret.webhook_secret.name
+      GITHUB_WEBHOOK_SECRET_NAME = local.webhook_secret_name
       SNS_TOPIC_ARN              = aws_sns_topic.ghapp.arn
       # Optional: limit inbound body size (defense-in-depth)
       MAX_BODY_BYTES             = "1048576"

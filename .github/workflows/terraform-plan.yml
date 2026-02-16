@@ -25,13 +25,14 @@ jobs:
     steps:
         # Checkout checks out the repository
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
         # Upload Configuration uploads the Terraform configuration to HCP Terraform and marks it as speculative so it cannot modify infrastructure
       - name: Upload Configuration
         uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.3.2
         id: plan-upload
         with:
+          token: ${{ env.TF_API_TOKEN }}
           workspace: ${{ env.TF_WORKSPACE }}
           directory: ${{ env.CONFIG_DIRECTORY }}
           speculative: true

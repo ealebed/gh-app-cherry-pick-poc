@@ -19,3 +19,9 @@ variable "worker_image" {
   type        = string
   default     = "docker.io/ealebed/cherrypicker:2025.11.03-08.06"
 }
+
+variable "secrets_available" {
+  description = "Set to true when ghapp/webhook_secret and ghapp/private_key_pem_b64 exist in AWS Secrets Manager. When false, placeholder ARNs are used (plan succeeds, apply will fail)."
+  type        = bool
+  default     = false
+}
