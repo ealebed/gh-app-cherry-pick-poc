@@ -35,7 +35,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: 'Build and push cherrypicker container image'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           push: true
           tags: ${{ vars.DOCKERHUB_USERNAME }}/cherrypicker:${{ steps.tagger.outputs.tag }},${{ vars.DOCKERHUB_USERNAME }}/cherrypicker:latest
