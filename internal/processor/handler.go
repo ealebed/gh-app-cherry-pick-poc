@@ -126,7 +126,8 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 			slog.Error("webhook.bad_payload", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 			return http.StatusBadRequest, fmt.Errorf("bad payload: %w", err)
 		}
-		go func() {
+		// Work runs after 202 response; must not use request context (would cancel on client disconnect).
+		go func() { // #nosec G118
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("webhook.panic", "delivery", sanitizeForLog(deliveryID), "panic", r)
@@ -142,7 +143,8 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 			slog.Error("webhook.bad_payload", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 			return http.StatusBadRequest, fmt.Errorf("bad payload: %w", err)
 		}
-		go func() {
+		// Work runs after 202 response; must not use request context.
+		go func() { // #nosec G118
 			ctx2, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 			p.handleCreateEvent(ctx2, deliveryID, &e)
@@ -157,7 +159,8 @@ func (p *Processor) HandleFromEnvelope(ctx context.Context, env qenv.Envelope) (
 			slog.Error("webhook.bad_payload", "delivery", sanitizeForLog(deliveryID), "err", safeErr(err))
 			return http.StatusBadRequest, fmt.Errorf("bad payload: %w", err)
 		}
-		go func() {
+		// Work runs after 202 response; must not use request context.
+		go func() { // #nosec G118
 			ctx2, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 			if e.GetAction() != "deleted" || e.GetRepo() == nil || e.GetLabel() == nil {
