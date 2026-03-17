@@ -39,7 +39,7 @@ func NewRunner(baseDir string, extraEnv ...string) (*Runner, error) {
 var reToken = regexp.MustCompile(`x-access-token:[^@]+@`)
 
 func (r *Runner) run(ctx context.Context, _ string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", args...) // #nosec G204 -- args are git subcommand args from internal callers (clone, checkout, etc.)
 	cmd.Dir = r.WorkDir
 	cmd.Env = r.Env
 
