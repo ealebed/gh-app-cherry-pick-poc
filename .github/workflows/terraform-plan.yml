@@ -55,7 +55,7 @@ jobs:
 
         # Update PR adds a comment to the pull request with a link to the run in HCP Terraform. It also removes any previous comments added by this workflow
       - name: Update PR
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         id: plan-comment
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
