@@ -27,22 +27,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Debug secret availability
-        env:
-          SECRET_AVAILABLE: ${{ secrets.TF_API_TOKEN != '' }}
-        run: |
-          echo "event_name=${{ github.event_name }}"
-          echo "actor=${{ github.actor }}"
-          echo "repository=${{ github.repository }}"
-          echo "secret_available=${SECRET_AVAILABLE}"
-          if [ -n "${TF_API_TOKEN}" ]; then
-            echo "tf_api_token_present=true"
-            echo "tf_api_token_length=${#TF_API_TOKEN}"
-          else
-            echo "tf_api_token_present=false"
-            echo "tf_api_token_length=0"
-          fi
-
         # Upload Configuration uploads the Terraform configuration to HCP Terraform and marks it as speculative so it cannot modify infrastructure
       - name: Upload Configuration
         uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.3.2
