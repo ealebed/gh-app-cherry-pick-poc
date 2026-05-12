@@ -23,6 +23,9 @@ import (
 	qenv "github.com/ealebed/gh-app-cherry-pick-poc/internal/queue"
 )
 
+// pullRequestStateOpen is GitHub's API value for an open pull request.
+const pullRequestStateOpen = "open"
+
 // Processor handles GitHub events from queue envelopes.
 type Processor struct {
 	AppID         int64
@@ -423,7 +426,7 @@ func (p *Processor) processMergedPRWith(
 		// Idempotency: work branch already exists?
 		if _, _, err := gh.Git().GetRef(ctx, owner, repo, "refs/heads/"+workBranch); err == nil {
 			prs, _, _ := gh.PR().List(ctx, owner, repo, &github.PullRequestListOptions{
-				State:       "open",
+				State:       pullRequestStateOpen,
 				Head:        fmt.Sprintf("%s:%s", owner, workBranch),
 				Base:        target,
 				ListOptions: github.ListOptions{PerPage: 1},
@@ -684,7 +687,7 @@ func (p *Processor) cleanupOpenAutoCherryForTarget(ctx context.Context, gh GH, o
 	prefix := "autocherry/" + safeTarget + "/"
 
 	prs, _, err := gh.PR().List(ctx, owner, repo, &github.PullRequestListOptions{
-		State:       "open",
+		State:       pullRequestStateOpen,
 		Base:        target,
 		ListOptions: github.ListOptions{PerPage: 100},
 	})
@@ -712,7 +715,7 @@ func (p *Processor) cleanupOpenAutoCherryForTarget(ctx context.Context, gh GH, o
 
 func (p *Processor) removeLabelFromOpenPRs(ctx context.Context, gh GH, owner, repo, label string) error {
 	issues, _, err := gh.Issues().ListByRepo(ctx, owner, repo, &github.IssueListByRepoOptions{
-		State:       "open",
+		State:       pullRequestStateOpen,
 		Labels:      []string{label},
 		ListOptions: github.ListOptions{PerPage: 100},
 	})
@@ -730,7 +733,7 @@ func (p *Processor) removeLabelFromOpenPRs(ctx context.Context, gh GH, owner, re
 
 func (p *Processor) processUnlabeled(ctx context.Context, gh GH, owner, repo string, _ int, target, workBranch string) error {
 	prs, _, err := gh.PR().List(ctx, owner, repo, &github.PullRequestListOptions{
-		State:       "open",
+		State:       pullRequestStateOpen,
 		Base:        target,
 		Head:        owner + ":" + workBranch, // exact match
 		ListOptions: github.ListOptions{PerPage: 50},
