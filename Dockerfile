@@ -8,7 +8,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/server ./cmd/server
 
 # Runtime (needs git)
-FROM alpine:3.24.0
+FROM alpine:3.24.1
 RUN apk add --no-cache ca-certificates git curl
 WORKDIR /srv
 COPY --from=build /out/server /srv/server
