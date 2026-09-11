@@ -9,8 +9,7 @@ on:
       - 'Dockerfile'
       - 'internal/**.go'
       - 'cmd/**.go'
-      - '.github/workflows/wfl_image_ci.yaml'
-      - '.github/workflows/tpl_*.yml'
+      - '.github/workflows/**'
   pull_request:
     branches: [ "master" ]
     paths:
@@ -19,8 +18,7 @@ on:
       - 'Dockerfile'
       - 'internal/**.go'
       - 'cmd/**.go'
-      - '.github/workflows/wfl_image_ci.yaml'
-      - '.github/workflows/tpl_*.yml'
+      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       branch:
