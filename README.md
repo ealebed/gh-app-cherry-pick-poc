@@ -143,6 +143,9 @@ This repo uses a templated CI:
 - On PRs, it validates: `gofmt`, `go vet`, `golangci-lint`, tests with race & coverage.
 - On pushes to `master`, it builds and pushes a container image to Docker Hub.
 
+## Dependabot automation
+Minor and patch Dependabot PRs are approved and squash-merged by a GitHub App after required CI passes. Terraform Dependabot PRs stay manual. See [Dependabot automation](./docs/dependabot-automation.md).
+
 ---
 
 ## Deploying to Google Cloud Run
