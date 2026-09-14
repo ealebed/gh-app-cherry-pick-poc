@@ -3,7 +3,7 @@ module github.com/ealebed/gh-app-cherry-pick-poc
 go 1.27.0
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.46.0
+	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.3
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.51.0
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
