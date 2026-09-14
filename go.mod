@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.4
-	github.com/aws/aws-sdk-go-v2/service/sqs v1.51.0
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.0
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
 	github.com/google/go-github/v75 v75.0.0
 	github.com/joho/godotenv v1.5.1
